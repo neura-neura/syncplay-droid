@@ -1,0 +1,13 @@
+Syncplay Droid
+
+This product implements protocol behavior derived from and compatible with Syncplay and the
+syncplay-noir fork, both distributed under the Apache License, Version 2.0.
+
+Syncplay authors and contributors:
+- Initial concept and core internals: Uriziel
+- GUI design and lead development: Et0h
+- Original SyncPlay code: Tomasz Kowalczyk (Fluxid)
+- Other Syncplay contributors
+
+This product uses AndroidX Media3 and other AndroidX components, Gson, Kotlin, and kotlinx
+coroutines. Their respective licenses and notices remain applicable.

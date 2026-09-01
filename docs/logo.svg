@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" role="img" aria-labelledby="title description">
+  <title id="title">Syncplay Droid</title>
+  <desc id="description">A play symbol surrounded by a sync ring.</desc>
+  <rect width="108" height="108" rx="24" fill="#0B1018"/>
+  <path fill="#F4B860" d="M54 20a34 34 0 1 0 0 68 34 34 0 1 0 0-68Zm0 8a26 26 0 1 1 0 52 26 26 0 1 1 0-52Z"/>
+  <path fill="#FFF4DF" d="M47 39v30l25-15Z"/>
+  <path fill="#63D8D2" d="M22 51h16v6H22Zm48 0h16v6H70Z"/>
+</svg>
