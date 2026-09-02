@@ -11,8 +11,8 @@ android {
         applicationId = "dev.neura.syncplay"
         minSdk = 23
         targetSdk = 37
-        versionCode = 6
-        versionName = "0.3.0"
+        versionCode = 8
+        versionName = "0.3.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
@@ -74,13 +74,19 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
 
     val media3Version = "1.11.0"
+    implementation("androidx.media3:media3-datasource:$media3Version")
     implementation("androidx.media3:media3-exoplayer:$media3Version")
     implementation("androidx.media3:media3-exoplayer-dash:$media3Version")
     implementation("androidx.media3:media3-exoplayer-hls:$media3Version")
     implementation("androidx.media3:media3-session:$media3Version")
     implementation("androidx.media3:media3-ui:$media3Version")
+    // LibVLC's public LGPL Android binding; the adapter uses only this API surface.
+    implementation("org.videolan.android:libvlc-all:3.7.5")
 
     implementation("com.google.code.gson:gson:2.14.0")
+    // SMBJ is Apache-2.0 licensed and provides the in-process SMB2/SMB3 transport used by
+    // SmbDataSource. Credentials remain in SmbConnectionProfileRegistry and are never persisted.
+    implementation("com.hierynomus:smbj:0.14.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")

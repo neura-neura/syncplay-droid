@@ -1,6 +1,9 @@
 package dev.neura.syncplay.ui
 
 import androidx.media3.common.Player
+import dev.neura.syncplay.player.PlaybackDiagnostics
+import dev.neura.syncplay.player.PlaybackEngineState
+import dev.neura.syncplay.player.SourceAccessClassification
 import dev.neura.syncplay.protocol.ChatEntry
 import dev.neura.syncplay.protocol.ConnectionConfig
 import dev.neura.syncplay.protocol.ConnectionStatus
@@ -16,6 +19,15 @@ data class PlaybackUiState(
     val syncOffsetMs: Long? = null,
     val syncAction: String = "Esperando estado de la sala",
     val error: String? = null,
+)
+
+data class SubtitleTrackUi(
+    val id: String,
+    val label: String,
+    val detail: String? = null,
+    val isSelected: Boolean = false,
+    val isSupported: Boolean = true,
+    val isExternal: Boolean = false,
 )
 
 data class SyncplayUiState(
@@ -34,11 +46,15 @@ data class SyncplayUiState(
     val sharedPlaylistIndex: Int? = null,
     val media: MediaDescriptor? = null,
     val mediaUri: String? = null,
+    val mediaSourceAccess: SourceAccessClassification = SourceAccessClassification.UNKNOWN,
     val isMediaLoading: Boolean = false,
     val isSubtitleLoading: Boolean = false,
     val subtitleName: String? = null,
+    val subtitleTracks: List<SubtitleTrackUi> = emptyList(),
     val localReady: Boolean = true,
     val player: Player? = null,
+    val playbackDiagnostics: PlaybackDiagnostics = PlaybackDiagnostics(),
+    val playbackEngine: PlaybackEngineState = PlaybackEngineState(),
     val playback: PlaybackUiState = PlaybackUiState(),
 )
 

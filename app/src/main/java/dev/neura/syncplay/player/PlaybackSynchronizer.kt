@@ -44,7 +44,7 @@ data class SynchronizerConfig(
     /** Time during which callbacks caused by a remote command are not sent back as local input. */
     val remoteEchoWindowMs: Long = 750L,
     /** Minimum spacing between automatic (non-explicit) seeks while a stream is unstable. */
-    val hardSeekCooldownMs: Long = 1_000L,
+    val hardSeekCooldownMs: Long = 5_000L,
     /** Position tolerance used when matching an asynchronous remote callback to its generation. */
     val echoPositionToleranceMs: Long = 350L,
     /** Polling cadence for progress and continued drift correction. */
@@ -137,6 +137,15 @@ internal fun classifyLocalPlaybackChange(
     playbackParametersChanged -> LocalPlaybackChangeReason.SPEED
     else -> LocalPlaybackChangeReason.OTHER
 }
+
+/**
+ * An explicit peer seek may replace a pending load. Automatic drift correction must wait until
+ * Media3 is ready so a slow SMB read is not restarted over and over while it is buffering.
+ */
+internal fun canSeekForRemoteCorrection(
+    playbackState: Int,
+    forceSeek: Boolean,
+): Boolean = forceSeek || playbackState == Player.STATE_READY
 
 /** Event emitted for local changes; [doSeek] is true for a Media3 position discontinuity. */
 data class LocalPlaybackEvent(
@@ -248,6 +257,15 @@ class PlaybackSynchronizer(
 
     /** Optional observer for diagnostics (network code normally only needs the return value). */
     var onRemoteApplied: ((RemoteApplyResult) -> Unit)? = null
+
+    /**
+     * Optional synchronous, item-validated path for frame-accurate explicit protocol seeks.
+     *
+     * This callback is consulted only when an incoming state has [RemotePlaybackState.doSeek]
+     * set. Automatic drift correction always uses the player's regular seek path so it retains
+     * the player's normal (CLOSEST_SYNC) seek parameters.
+     */
+    var onRemoteSeekRequested: ((Long) -> Boolean)? = null
 
     private var attachedPlayer: Player? = null
     private var closed = false
@@ -473,9 +491,19 @@ class PlaybackSynchronizer(
                     // must bypass the playing-state seek cooldown.  Explicit seeks likewise
                     // always win; the cooldown only throttles repeated automatic seeks while
                     // both sides are actively playing.
-                    val seekAllowed = forceSeek || state.paused || automaticSeekAllowed(now)
-                    seekApplied = seekAllowed && seekTo(player, targetPositionMs)
-                    if (seekApplied && !forceSeek) lastAutomaticSeekAtMs = now
+                    val seekAllowed = canSeekForRemoteCorrection(
+                        playbackState = safePlaybackState(player),
+                        forceSeek = forceSeek,
+                    ) && (forceSeek || state.paused || automaticSeekAllowed(now))
+                    seekApplied = seekAllowed && seekTo(
+                        player = player,
+                        targetPositionMs = targetPositionMs,
+                        exact = forceSeek,
+                    )
+                    // Explicit seeks bypass an existing cooldown, but once accepted they also
+                    // start it so the ticker cannot immediately repeat the same expensive SMB
+                    // random read while the new keyframe is still buffering.
+                    if (seekApplied) lastAutomaticSeekAtMs = now
                     if (seekApplied || state.paused) {
                         resetCorrection(player)
                     } else {
@@ -553,6 +581,7 @@ class PlaybackSynchronizer(
         progressJob.cancel()
         if (ownsScope) synchronizerScope.cancel()
         pendingRemoteState = null
+        onRemoteSeekRequested = null
         remoteAnchor = null
         _localState.value = null
         _progress.value = null
@@ -579,10 +608,27 @@ class PlaybackSynchronizer(
             return
         }
 
-        // Do not turn a local pause into an unsolicited play.  The next server state will make
-        // the play/pause decision; while playing, however, continue convergence between updates.
+        // Never restart a provider read while Media3 is buffering/idle. Slow SMB content URIs may
+        // otherwise be sent a new seek on every tick and never reach READY.
+        if (safePlaybackState(player) != Player.STATE_READY) return
+
+        // Do not turn a local pause into an unsolicited play. A paused anchor can still converge
+        // once the previous read is ready because playback-rate nudging is unavailable.
         if (anchor.paused || !player.playWhenReady) {
-            if (anchor.paused) resetCorrection(player)
+            if (anchor.paused) {
+                resetCorrection(player)
+                val target = projectedTarget(anchor, now)
+                val pausedErrorMs = target - safeCurrentPosition(player)
+                if (abs(pausedErrorMs) > config.driftToleranceMs && automaticSeekAllowed(now) &&
+                    seekTo(player, target, exact = false)
+                ) {
+                    lastAutomaticSeekAtMs = now
+                    suppressOutgoingUntilMs = maxOf(
+                        suppressOutgoingUntilMs,
+                        now + config.remoteEchoWindowMs,
+                    )
+                }
+            }
             return
         }
 
@@ -598,7 +644,7 @@ class PlaybackSynchronizer(
         )
         when (decision.action) {
             DriftAction.SEEK -> {
-                if (automaticSeekAllowed(now) && seekTo(player, target)) {
+                if (automaticSeekAllowed(now) && seekTo(player, target, exact = false)) {
                     lastAutomaticSeekAtMs = now
                     suppressOutgoingUntilMs = maxOf(suppressOutgoingUntilMs, now + config.remoteEchoWindowMs)
                     resetCorrection(player)
@@ -753,9 +799,26 @@ class PlaybackSynchronizer(
             .onFailure { expectedInternalSpeed = null }
     }
 
-    private fun seekTo(player: Player, targetPositionMs: Long): Boolean {
+    /**
+     * Seek to a correction target. Only an explicit remote doSeek may use the exact-seek bridge;
+     * ticker and hard-drift corrections stay on [Player.seekTo], which uses the player's normal
+     * seek parameters (CLOSEST_SYNC for PlaybackService).
+     */
+    private fun seekTo(
+        player: Player,
+        targetPositionMs: Long,
+        exact: Boolean,
+    ): Boolean {
         if (!commandAvailable(player, Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM)) return false
         val target = clampToDuration(player, targetPositionMs)
+        if (exact) {
+            onRemoteSeekRequested?.let { synchronizedSeek ->
+                // An installed handler is authoritative: false means its media-identity/looper
+                // guard rejected the explicit seek. Falling back here could apply an old item's
+                // target to a new item.
+                return runCatching { synchronizedSeek(target) }.getOrDefault(false)
+            }
+        }
         return runCatching { player.seekTo(target) }.isSuccess
     }
 
@@ -847,6 +910,10 @@ class PlaybackSynchronizer(
     private fun safePlaybackSpeed(player: Player): Float = runCatching {
         player.playbackParameters.speed
     }.getOrDefault(1f).coerceIn(MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED)
+
+    private fun safePlaybackState(player: Player?): Int = runCatching {
+        player?.playbackState ?: Player.STATE_IDLE
+    }.getOrDefault(Player.STATE_IDLE)
 
     private fun clampToDuration(player: Player?, positionMs: Long): Long {
         val positive = positionMs.coerceAtLeast(0L)

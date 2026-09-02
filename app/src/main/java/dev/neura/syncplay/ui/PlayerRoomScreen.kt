@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
 import android.graphics.Color as AndroidColor
+import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.BorderStroke
@@ -14,6 +15,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
@@ -29,10 +31,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
@@ -44,6 +48,7 @@ import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ClosedCaption
+import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.Groups
 import androidx.compose.material.icons.rounded.HourglassEmpty
 import androidx.compose.material.icons.rounded.Key
@@ -51,10 +56,12 @@ import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.LockOpen
 import androidx.compose.material.icons.rounded.MeetingRoom
+import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Movie
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.QueuePlayNext
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Storage
 import androidx.compose.material.icons.rounded.VideoFile
 import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material3.AlertDialog
@@ -63,6 +70,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
@@ -76,6 +85,7 @@ import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.PrimaryTabRow
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.PlainTooltip
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -100,9 +110,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.semantics
@@ -126,6 +138,15 @@ import dev.neura.syncplay.protocol.ChatEntry
 import dev.neura.syncplay.protocol.ConnectionStatus
 import dev.neura.syncplay.protocol.RoomUser
 import dev.neura.syncplay.protocol.supportsSyncplayFeature
+import dev.neura.syncplay.player.AudioFormatDiagnostics
+import dev.neura.syncplay.player.PlaybackDiagnostics
+import dev.neura.syncplay.player.PlaybackEngine
+import dev.neura.syncplay.player.PlaybackEnginePreference
+import dev.neura.syncplay.player.PlaybackEngineReason
+import dev.neura.syncplay.player.PlaybackEngineState
+import dev.neura.syncplay.player.VideoFormatDiagnostics
+import dev.neura.syncplay.player.SourceAccessClassification
+import java.util.Locale
 import kotlin.math.abs
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -134,17 +155,25 @@ fun PlayerRoomScreen(
     state: SyncplayUiState,
     onOpenFile: () -> Unit,
     onOpenUrl: (String) -> Unit,
+    onOpenSmbMedia: () -> Unit = {},
     onOpenSubtitle: () -> Unit,
+    onOpenSmbSubtitle: () -> Unit = {},
+    onSelectSubtitleTrack: (String?) -> Unit = {},
     onToggleReady: () -> Unit,
     onSendChat: (String) -> Boolean,
     onChangeRoom: (String) -> Unit,
     onDisconnect: () -> Unit,
     onDismissPlaybackError: () -> Unit,
+    onSetPlaybackEngine: (PlaybackEnginePreference) -> Unit = {},
 ) {
     var panel by rememberSaveable { mutableStateOf(RoomPanel.PEOPLE) }
     var showUrlDialog by rememberSaveable { mutableStateOf(false) }
     var showRoomDialog by rememberSaveable { mutableStateOf(false) }
+    var showSubtitleDialog by rememberSaveable { mutableStateOf(false) }
+    var showDiagnosticsDialog by rememberSaveable { mutableStateOf(false) }
+    var showEngineDialog by rememberSaveable { mutableStateOf(false) }
     var isFullscreen by rememberSaveable { mutableStateOf(false) }
+    val openSubtitleSelector = { showSubtitleDialog = true }
     val fullscreenActive = isFullscreen && state.player != null && state.media != null
     val roomUsers = state.users.filter { it.room == state.effectiveRoom }
     val companionCount = roomUsers.count { it.username != state.effectiveUsername }
@@ -164,8 +193,29 @@ fun PlayerRoomScreen(
         FullscreenPlayerScreen(
             player = state.player,
             isMediaLoading = state.isMediaLoading,
+            isSubtitleLoading = state.isSubtitleLoading,
             onFullscreenChange = { isFullscreen = it },
+            onSubtitle = openSubtitleSelector,
         )
+        if (showSubtitleDialog) {
+            SubtitleSelectorDialog(
+                tracks = state.subtitleTracks,
+                isLoading = state.isMediaLoading || state.isSubtitleLoading,
+                onSelect = { trackId ->
+                    showSubtitleDialog = false
+                    onSelectSubtitleTrack(trackId)
+                },
+                onOpenExternal = {
+                    showSubtitleDialog = false
+                    onOpenSubtitle()
+                },
+                onOpenSmb = {
+                    showSubtitleDialog = false
+                    onOpenSmbSubtitle()
+                },
+                onDismiss = { showSubtitleDialog = false },
+            )
+        }
         return
     }
 
@@ -182,6 +232,8 @@ fun PlayerRoomScreen(
                     companionSummary = companionSummary,
                     onChangeRoom = { showRoomDialog = true },
                     onDisconnect = onDisconnect,
+                    onShowDiagnostics = { showDiagnosticsDialog = true },
+                    onShowPlaybackEngine = { showEngineDialog = true },
                 )
             },
             bottomBar = {
@@ -200,6 +252,9 @@ fun PlayerRoomScreen(
                     .consumeWindowInsets(padding),
             ) {
                 ConnectionBanner(state.connectionStatus)
+                if (state.mediaSourceAccess == SourceAccessClassification.SEQUENTIAL) {
+                    SequentialProviderBanner(onOpenSmbMedia)
+                }
                 state.playback.error?.let { error ->
                     ErrorBanner(error, onDismissPlaybackError)
                 }
@@ -220,7 +275,8 @@ fun PlayerRoomScreen(
                                 state = state,
                                 onOpenFile = onOpenFile,
                                 onOpenUrl = { showUrlDialog = true },
-                                onOpenSubtitle = onOpenSubtitle,
+                                onOpenSmb = onOpenSmbMedia,
+                                onOpenSubtitleSelector = openSubtitleSelector,
                                 onFullscreenChange = { isFullscreen = it },
                                 modifier = Modifier
                                     .weight(1f)
@@ -231,7 +287,8 @@ fun PlayerRoomScreen(
                                 state = state,
                                 onOpenFile = onOpenFile,
                                 onOpenUrl = { showUrlDialog = true },
-                                onOpenSubtitle = onOpenSubtitle,
+                                onOpenSmb = onOpenSmbMedia,
+                                onOpenSubtitleSelector = openSubtitleSelector,
                                 onToggleReady = onToggleReady,
                                 compact = compactActions,
                             )
@@ -263,7 +320,8 @@ fun PlayerRoomScreen(
                                 state = state,
                                 onOpenFile = onOpenFile,
                                 onOpenUrl = { showUrlDialog = true },
-                                onOpenSubtitle = onOpenSubtitle,
+                                onOpenSmb = onOpenSmbMedia,
+                                onOpenSubtitleSelector = openSubtitleSelector,
                                 onFullscreenChange = { isFullscreen = it },
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -275,7 +333,8 @@ fun PlayerRoomScreen(
                                 state = state,
                                 onOpenFile = onOpenFile,
                                 onOpenUrl = { showUrlDialog = true },
-                                onOpenSubtitle = onOpenSubtitle,
+                                onOpenSmb = onOpenSmbMedia,
+                                onOpenSubtitleSelector = openSubtitleSelector,
                                 onFullscreenChange = { isFullscreen = it },
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -287,7 +346,8 @@ fun PlayerRoomScreen(
                             state = state,
                             onOpenFile = onOpenFile,
                             onOpenUrl = { showUrlDialog = true },
-                            onOpenSubtitle = onOpenSubtitle,
+                            onOpenSmb = onOpenSmbMedia,
+                            onOpenSubtitleSelector = openSubtitleSelector,
                             onToggleReady = onToggleReady,
                             compact = compactActions,
                         )
@@ -340,6 +400,528 @@ fun PlayerRoomScreen(
             },
         )
     }
+    if (showSubtitleDialog) {
+        SubtitleSelectorDialog(
+            tracks = state.subtitleTracks,
+            isLoading = state.isMediaLoading || state.isSubtitleLoading,
+            onSelect = { trackId ->
+                showSubtitleDialog = false
+                onSelectSubtitleTrack(trackId)
+            },
+            onOpenExternal = {
+                showSubtitleDialog = false
+                onOpenSubtitle()
+            },
+            onOpenSmb = {
+                showSubtitleDialog = false
+                onOpenSmbSubtitle()
+            },
+            onDismiss = { showSubtitleDialog = false },
+        )
+    }
+    if (showDiagnosticsDialog) {
+        PlaybackDiagnosticsDialog(
+            diagnostics = state.playbackDiagnostics,
+            engine = state.playbackEngine,
+            onDismiss = { showDiagnosticsDialog = false },
+        )
+    }
+    if (showEngineDialog) {
+        PlaybackEngineDialog(
+            state = state.playbackEngine,
+            onSelect = { preference ->
+                showEngineDialog = false
+                onSetPlaybackEngine(preference)
+            },
+            onDismiss = { showEngineDialog = false },
+        )
+    }
+}
+
+@Composable
+private fun SubtitleSelectorDialog(
+    tracks: List<SubtitleTrackUi>,
+    isLoading: Boolean,
+    onSelect: (String?) -> Unit,
+    onOpenExternal: () -> Unit,
+    onOpenSmb: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val noSubtitleSelected = tracks.none { it.isSelected }
+    val maxListHeight = (LocalConfiguration.current.screenHeightDp * 0.4f)
+        .dp
+        .coerceIn(128.dp, 320.dp)
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Subtítulos") },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = "Elige una pista para este dispositivo.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp, max = maxListHeight),
+                    contentPadding = PaddingValues(vertical = 4.dp),
+                ) {
+                    item {
+                        SubtitleTrackOption(
+                            label = "Sin subtítulos",
+                            detail = "Desactivar subtítulos",
+                            selected = noSubtitleSelected,
+                            enabled = !isLoading,
+                            onClick = { onSelect(null) },
+                        )
+                    }
+                    items(tracks) { track ->
+                        val detail = buildList {
+                            track.detail?.takeIf { it.isNotBlank() }?.let(::add)
+                            add(if (track.isExternal) "Archivo externo" else "Pista del video")
+                            if (!track.isSupported) add("No compatible")
+                        }.joinToString(" · ")
+                        SubtitleTrackOption(
+                            label = track.label,
+                            detail = detail,
+                            selected = track.isSelected,
+                            enabled = !isLoading && track.isSupported,
+                            onClick = { onSelect(track.id) },
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                TextButton(
+                    onClick = onOpenExternal,
+                    enabled = !isLoading,
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    Text("Explorador")
+                }
+                TextButton(
+                    onClick = onOpenSmb,
+                    enabled = !isLoading,
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    Text("SMB directo")
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) {
+                Text("Cerrar")
+            }
+        },
+    )
+}
+
+@Composable
+private fun SubtitleTrackOption(
+    label: String,
+    detail: String?,
+    selected: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    val labelColor = if (enabled) {
+        MaterialTheme.colorScheme.onSurface
+    } else {
+        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+    }
+    val detailColor = if (enabled) {
+        MaterialTheme.colorScheme.onSurfaceVariant
+    } else {
+        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.32f)
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 56.dp)
+            .selectable(
+                selected = selected,
+                enabled = enabled,
+                role = Role.RadioButton,
+                onClick = onClick,
+            )
+            .semantics(mergeDescendants = true) {}
+            .padding(horizontal = 4.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RadioButton(
+            selected = selected,
+            onClick = null,
+            enabled = enabled,
+        )
+        Spacer(Modifier.width(10.dp))
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = label,
+                color = labelColor,
+                style = MaterialTheme.typography.bodyLarge,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            detail?.takeIf { it.isNotBlank() }?.let {
+                Text(
+                    text = it,
+                    color = detailColor,
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PlaybackDiagnosticsDialog(
+    diagnostics: PlaybackDiagnostics,
+    engine: PlaybackEngineState,
+    onDismiss: () -> Unit,
+) {
+    val maxListHeight = (LocalConfiguration.current.screenHeightDp * 0.58f)
+        .dp
+        .coerceIn(220.dp, 520.dp)
+    val source = diagnostics.sourceType?.let { type ->
+        diagnostics.sourceScheme?.let { scheme -> "$type · $scheme" } ?: type
+    } ?: "Sin video abierto"
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Diagnóstico de reproducción") },
+        text = {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = maxListHeight),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                item {
+                    Text(
+                        "Datos del reproductor de este dispositivo. Se actualizan mientras reproduces.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(bottom = 8.dp),
+                    )
+                }
+                item { DiagnosticRow("Origen", source) }
+                item { DiagnosticRow("Motor", playbackEngineSummary(engine)) }
+                item {
+                    DiagnosticRow(
+                        "Dispositivo",
+                        "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE} " +
+                            "(API ${Build.VERSION.SDK_INT})",
+                    )
+                }
+                item { DiagnosticRow("Interpretación", diagnosticsAssessment(diagnostics, engine)) }
+                item {
+                    DiagnosticRow(
+                        "Decodificador de video",
+                        diagnostics.videoDecoderName ?: "Sin datos todavía",
+                    )
+                }
+                item {
+                    DiagnosticRow(
+                        "Formato de video",
+                        diagnostics.videoFormat?.let(::formatVideoDiagnostics) ?: "Sin datos todavía",
+                    )
+                }
+                item {
+                    DiagnosticRow(
+                        "Decodificador de audio",
+                        diagnostics.audioDecoderName ?: "Sin datos todavía",
+                    )
+                }
+                item {
+                    DiagnosticRow(
+                        "Formato de audio",
+                        diagnostics.audioFormat?.let(::formatAudioDiagnostics) ?: "Sin datos todavía",
+                    )
+                }
+                item {
+                    DiagnosticRow(
+                        "Frames de video descartados",
+                        buildString {
+                            append(diagnostics.droppedVideoFrames)
+                            append(" · mayor lote informado ")
+                            append(diagnostics.maxConsecutiveDroppedVideoFrames ?: "—")
+                        },
+                    )
+                }
+                item {
+                    DiagnosticRow(
+                        "Procesamiento de video",
+                        formatProcessingOffset(diagnostics),
+                    )
+                }
+                item {
+                    DiagnosticRow(
+                        "Underruns de audio",
+                        formatAudioUnderruns(diagnostics),
+                    )
+                }
+                item {
+                    DiagnosticRow(
+                        "Buffering",
+                        buildString {
+                            append(diagnostics.bufferingCount)
+                            append(if (diagnostics.bufferingCount == 1) " vez" else " veces")
+                            append(" · ")
+                            append(formatDurationMs(diagnostics.bufferingDurationMs))
+                            if (diagnostics.isBuffering) append(" · en curso")
+                        },
+                    )
+                }
+                item {
+                    DiagnosticRow(
+                        "Velocidad estimada de la fuente",
+                        diagnostics.networkBitrateEstimateBitsPerSecond?.let { estimate ->
+                            "${formatLongBitrate(estimate)} · última muestra " +
+                                (diagnostics.lastBandwidthSampleBytes?.let(::formatDiagnosticBytes) ?: "—")
+                        } ?: "Sin datos todavía",
+                    )
+                }
+                item {
+                    DiagnosticRow(
+                        "Errores de carga",
+                        formatErrorCount(diagnostics.loadErrorCount, diagnostics.lastLoadError),
+                    )
+                }
+                item {
+                    DiagnosticRow(
+                        "Errores de reproducción",
+                        formatErrorCount(diagnostics.playerErrorCount, diagnostics.lastPlayerError),
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) {
+                Text("Cerrar")
+            }
+        },
+    )
+}
+
+@Composable
+private fun PlaybackEngineDialog(
+    state: PlaybackEngineState,
+    onSelect: (PlaybackEnginePreference) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val options = listOf(
+        Triple(
+            PlaybackEnginePreference.AUTOMATIC,
+            "Automático (recomendado)",
+            "Usa VLC para MKV exigentes y AndroidX Media3 para los demás formatos.",
+        ),
+        Triple(
+            PlaybackEnginePreference.MEDIA3,
+            "AndroidX Media3",
+            "Motor nativo principal; ideal para MP4, HLS y DASH.",
+        ),
+        Triple(
+            PlaybackEnginePreference.VLC,
+            "VLC (compatibilidad)",
+            "Alternativa para HEVC Main10, MKV, audio multicanal o decodificadores problemáticos.",
+        ),
+    )
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Motor de reproducción") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    "Motor activo: ${if (state.active == PlaybackEngine.VLC) "VLC" else "AndroidX Media3"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = 8.dp),
+                )
+                options.forEach { (preference, title, detail) ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 56.dp)
+                            .selectable(
+                                selected = state.preference == preference,
+                                role = Role.RadioButton,
+                                onClick = { onSelect(preference) },
+                            )
+                            .padding(horizontal = 4.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(
+                            selected = state.preference == preference,
+                            onClick = null,
+                        )
+                        Column(modifier = Modifier.padding(start = 8.dp)) {
+                            Text(title, style = MaterialTheme.typography.bodyLarge)
+                            Text(
+                                detail,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Cerrar") } },
+    )
+}
+
+private fun playbackEngineSummary(state: PlaybackEngineState): String {
+    val active = if (state.active == PlaybackEngine.VLC) "VLC" else "AndroidX Media3"
+    val preference = when (state.preference) {
+        PlaybackEnginePreference.AUTOMATIC -> "automático"
+        PlaybackEnginePreference.MEDIA3 -> "selección manual Media3"
+        PlaybackEnginePreference.VLC -> "selección manual VLC"
+    }
+    val reason = when (state.reason) {
+        PlaybackEngineReason.MATROSKA_COMPATIBILITY -> "compatibilidad MKV/HEVC"
+        PlaybackEngineReason.USER_SELECTION -> "elegido por ti"
+        PlaybackEngineReason.DEFAULT -> "predeterminado"
+    }
+    return "$active · $preference · $reason"
+}
+
+@Composable
+private fun DiagnosticRow(
+    label: String,
+    value: String,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 5.dp),
+        verticalArrangement = Arrangement.spacedBy(1.dp),
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+    }
+}
+
+private fun formatVideoDiagnostics(format: VideoFormatDiagnostics): String = buildList {
+    format.sampleMimeType?.let { add(it) }
+    format.codecs?.let { add("códec $it") }
+    format.profile?.let { add("perfil/nivel $it") }
+    if (format.width != null && format.height != null) add("${format.width}×${format.height}")
+    format.frameRate?.let { add(String.format(Locale.ROOT, "%.2f fps", it)) }
+    format.bitrate?.let { add(formatBitrate(it)) }
+    format.rotationDegrees?.takeIf { it != 0 }?.let { add("rotación ${it}°") }
+}.joinToString(" · ").ifBlank { "Sin datos" }
+
+private fun formatAudioDiagnostics(format: AudioFormatDiagnostics): String = buildList {
+    format.sampleMimeType?.let { add(it) }
+    format.codecs?.let { add("códec $it") }
+    format.channelCount?.let { add(if (it == 1) "mono" else "$it canales") }
+    format.sampleRate?.let { add("${it} Hz") }
+    format.bitrate?.let { add(formatBitrate(it)) }
+    format.language?.let { add(it) }
+}.joinToString(" · ").ifBlank { "Sin datos" }
+
+private fun formatProcessingOffset(diagnostics: PlaybackDiagnostics): String {
+    val frameCount = diagnostics.videoProcessingFrameCount
+    if (frameCount <= 0) return "Sin datos todavía"
+    val averageMs = diagnostics.videoProcessingOffsetUs / frameCount / 1_000.0
+    return String.format(
+        Locale.ROOT,
+        "promedio %+.2f ms · %d frames",
+        averageMs,
+        frameCount,
+    )
+}
+
+private fun diagnosticsAssessment(
+    diagnostics: PlaybackDiagnostics,
+    engine: PlaybackEngineState,
+): String {
+    val averageOffsetMs = if (diagnostics.videoProcessingFrameCount > 0) {
+        diagnostics.videoProcessingOffsetUs / diagnostics.videoProcessingFrameCount / 1_000.0
+    } else {
+        null
+    }
+    return when {
+        diagnostics.playerErrorCount > 0 ->
+            "El reproductor informó un fallo; revisa el último error debajo."
+        engine.active == PlaybackEngine.VLC ->
+            "Compatibilidad VLC activa. Los contadores internos del decodificador Media3 no " +
+                "están disponibles en este modo."
+        diagnostics.loadErrorCount > 0 || diagnostics.bufferingCount >= 3 ->
+            "La fuente o la red no están alimentando el buffer de forma estable. Usa SMB directo."
+        diagnostics.droppedVideoFrames >= 24 || (averageOffsetMs != null && averageOffsetMs < -30.0) ->
+            "El buffer parece llegar, pero el decodificador de video va tarde. Es probable que sea el códec del dispositivo."
+        diagnostics.audioUnderruns >= 3 ->
+            "El audio no está llegando o decodificándose a tiempo; prueba otra pista de audio."
+        diagnostics.videoDecoderName == null ->
+            "Reproduce durante 20–30 segundos para reunir datos del decodificador."
+        else -> "No se detecta todavía una señal clara de red o decodificador."
+    }
+}
+
+private fun formatAudioUnderruns(diagnostics: PlaybackDiagnostics): String = buildString {
+    append(diagnostics.audioUnderruns)
+    if (diagnostics.lastAudioUnderrunBufferMs != null) {
+        append(" · último buffer ${diagnostics.lastAudioUnderrunBufferMs} ms")
+    }
+    if (diagnostics.lastAudioUnderrunSinceFeedMs != null) {
+        append(" · sin datos ${diagnostics.lastAudioUnderrunSinceFeedMs} ms")
+    }
+}
+
+private fun formatErrorCount(count: Int, lastError: String?): String = buildString {
+    append(count)
+    append(if (count == 1) " error" else " errores")
+    lastError?.takeIf { it.isNotBlank() }?.let {
+        append(" · ")
+        append(it)
+    }
+}
+
+private fun formatBitrate(bitrate: Int): String = when {
+    bitrate >= 1_000_000 -> String.format(Locale.ROOT, "%.1f Mb/s", bitrate / 1_000_000.0)
+    bitrate >= 1_000 -> "${bitrate / 1_000} kb/s"
+    else -> "$bitrate b/s"
+}
+
+private fun formatDurationMs(durationMs: Long): String = when {
+    durationMs >= 60_000L -> String.format(Locale.ROOT, "%.1f min", durationMs / 60_000.0)
+    durationMs >= 1_000L -> String.format(Locale.ROOT, "%.1f s", durationMs / 1_000.0)
+    else -> "$durationMs ms"
+}
+
+private fun formatLongBitrate(bitsPerSecond: Long): String = when {
+    bitsPerSecond >= 1_000_000L -> String.format(Locale.ROOT, "%.1f Mb/s", bitsPerSecond / 1_000_000.0)
+    bitsPerSecond >= 1_000L -> String.format(Locale.ROOT, "%.1f kb/s", bitsPerSecond / 1_000.0)
+    else -> "$bitsPerSecond b/s"
+}
+
+private fun formatDiagnosticBytes(bytes: Long): String = when {
+    bytes >= 1024L * 1024L -> String.format(Locale.ROOT, "%.1f MB", bytes / (1024.0 * 1024.0))
+    bytes >= 1024L -> String.format(Locale.ROOT, "%.1f KB", bytes / 1024.0)
+    else -> "$bytes B"
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -349,9 +931,12 @@ private fun RoomTopAppBar(
     companionSummary: String,
     onChangeRoom: () -> Unit,
     onDisconnect: () -> Unit,
+    onShowDiagnostics: () -> Unit,
+    onShowPlaybackEngine: () -> Unit,
 ) {
     val connected = state.connectionStatus as? ConnectionStatus.Connected
     val secure = connected?.secure == true
+    var overflowExpanded by rememberSaveable { mutableStateOf(false) }
     TopAppBar(
         title = {
             Column(modifier = Modifier.fillMaxWidth()) {
@@ -423,6 +1008,43 @@ private fun RoomTopAppBar(
             ) {
                 IconButton(onClick = onDisconnect) {
                     Icon(Icons.AutoMirrored.Rounded.Logout, contentDescription = "Desconectar")
+                }
+            }
+            Box {
+                TooltipBox(
+                    positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Above),
+                    tooltip = { PlainTooltip { Text("Más opciones") } },
+                    state = rememberTooltipState(),
+                ) {
+                    IconButton(onClick = { overflowExpanded = true }) {
+                        Icon(Icons.Rounded.MoreVert, contentDescription = "Más opciones")
+                    }
+                }
+                DropdownMenu(
+                    expanded = overflowExpanded,
+                    onDismissRequest = { overflowExpanded = false },
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("Motor de reproducción") },
+                        leadingIcon = { Icon(Icons.Rounded.Movie, contentDescription = null) },
+                        onClick = {
+                            overflowExpanded = false
+                            onShowPlaybackEngine()
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Diagnóstico de reproducción") },
+                        leadingIcon = {
+                            Icon(
+                                Icons.Rounded.BugReport,
+                                contentDescription = null,
+                            )
+                        },
+                        onClick = {
+                            overflowExpanded = false
+                            onShowDiagnostics()
+                        },
+                    )
                 }
             }
         },
@@ -539,7 +1161,8 @@ private fun PlayerPane(
     state: SyncplayUiState,
     onOpenFile: () -> Unit,
     onOpenUrl: () -> Unit,
-    onOpenSubtitle: () -> Unit,
+    onOpenSmb: () -> Unit,
+    onOpenSubtitleSelector: () -> Unit,
     onFullscreenChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -651,6 +1274,16 @@ private fun PlayerPane(
                         Spacer(Modifier.width(8.dp))
                         Text(if (tightEmptyState) "URL" else "Abrir URL", maxLines = 1)
                     }
+                    OutlinedButton(
+                        onClick = onOpenSmb,
+                        modifier = Modifier
+                            .widthIn(min = if (tightEmptyState) 128.dp else 160.dp)
+                            .heightIn(min = if (tightEmptyState) 48.dp else 52.dp),
+                    ) {
+                        Icon(Icons.Rounded.Storage, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text(if (tightEmptyState) "SMB" else "SMB directo", maxLines = 1)
+                    }
                 }
             }
         } else {
@@ -668,19 +1301,29 @@ private fun PlayerPane(
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp).widthIn(max = 360.dp),
                 )
             }
-            if (state.subtitleName != null) {
+            val selectedSubtitle = state.subtitleTracks.firstOrNull { it.isSelected }
+            if (state.subtitleName != null || state.subtitleTracks.isNotEmpty()) {
                 AssistChip(
-                    onClick = onOpenSubtitle,
+                    onClick = onOpenSubtitleSelector,
                     enabled = !state.isSubtitleLoading && !state.isMediaLoading,
                     label = {
                         Text(
-                            state.subtitleName,
+                            selectedSubtitle?.label ?: state.subtitleName ?: "Subtítulos",
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
                     },
-                    leadingIcon = { Icon(Icons.Rounded.ClosedCaption, null) },
-                    modifier = Modifier.align(Alignment.TopEnd).padding(12.dp).widthIn(max = 230.dp),
+                    leadingIcon = {
+                        Icon(
+                            Icons.Rounded.ClosedCaption,
+                            contentDescription = null,
+                        )
+                    },
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(12.dp)
+                        .heightIn(min = 48.dp)
+                        .widthIn(max = 230.dp),
                 )
             }
         }
@@ -706,7 +1349,7 @@ private fun Media3PlayerView(
                 useController = controlsEnabled
                 controllerAutoShow = true
                 controllerShowTimeoutMs = 3_000
-                setShowSubtitleButton(true)
+                setShowSubtitleButton(false)
                 setShowShuffleButton(false)
                 setShowNextButton(false)
                 setShowPreviousButton(false)
@@ -719,6 +1362,7 @@ private fun Media3PlayerView(
         update = {
             it.player = player
             it.useController = controlsEnabled
+            it.setShowSubtitleButton(false)
             it.setFullscreenButtonClickListener(onFullscreenChange)
             it.setFullscreenButtonState(isFullscreen)
         },
@@ -734,7 +1378,9 @@ private fun Media3PlayerView(
 private fun FullscreenPlayerScreen(
     player: Player?,
     isMediaLoading: Boolean,
+    isSubtitleLoading: Boolean,
     onFullscreenChange: (Boolean) -> Unit,
+    onSubtitle: () -> Unit,
 ) {
     Box(
         modifier = Modifier.fillMaxSize().background(Color.Black),
@@ -747,6 +1393,26 @@ private fun FullscreenPlayerScreen(
                 controlsEnabled = !isMediaLoading,
                 onFullscreenChange = onFullscreenChange,
             )
+        }
+        Surface(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .windowInsetsPadding(WindowInsets.safeDrawing)
+                .padding(12.dp),
+            shape = CircleShape,
+            color = Color.Black.copy(alpha = 0.72f),
+            contentColor = Color.White,
+        ) {
+            IconButton(
+                onClick = onSubtitle,
+                enabled = !isMediaLoading && !isSubtitleLoading,
+                modifier = Modifier.size(48.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.ClosedCaption,
+                    contentDescription = "Seleccionar subtítulos",
+                )
+            }
         }
         if (isMediaLoading) {
             MediaLoadingOverlay(modifier = Modifier.align(Alignment.Center))
@@ -835,7 +1501,8 @@ private fun MediaActionBar(
     state: SyncplayUiState,
     onOpenFile: () -> Unit,
     onOpenUrl: () -> Unit,
-    onOpenSubtitle: () -> Unit,
+    onOpenSmb: () -> Unit,
+    onOpenSubtitleSelector: () -> Unit,
     onToggleReady: () -> Unit,
     compact: Boolean,
 ) {
@@ -869,7 +1536,15 @@ private fun MediaActionBar(
                 Text("URL")
             }
             OutlinedButton(
-                onClick = onOpenSubtitle,
+                onClick = onOpenSmb,
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) {
+                Icon(Icons.Rounded.Storage, contentDescription = null)
+                Spacer(Modifier.width(6.dp))
+                Text("SMB")
+            }
+            OutlinedButton(
+                onClick = onOpenSubtitleSelector,
                 enabled = !state.isMediaLoading && !state.isSubtitleLoading,
                 modifier = Modifier.heightIn(min = 48.dp),
             ) {
@@ -1485,6 +2160,31 @@ private fun ConnectionBanner(status: ConnectionStatus) {
             }
         }
         else -> Unit
+    }
+}
+
+@Composable
+private fun SequentialProviderBanner(onOpenSmb: () -> Unit) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = MaterialTheme.colorScheme.tertiaryContainer,
+        contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Icon(Icons.Rounded.WarningAmber, contentDescription = null)
+            Text(
+                "El explorador entregó un flujo secuencial: adelantar un MKV grande puede atorarse.",
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = onOpenSmb, modifier = Modifier.heightIn(min = 48.dp)) {
+                Text("Abrir por SMB")
+            }
+        }
     }
 }
 

@@ -28,7 +28,10 @@ import dev.neura.syncplay.ui.FilePickerAppDialog
 import dev.neura.syncplay.ui.PlayerRoomScreen
 import dev.neura.syncplay.ui.SyncplayUiState
 import dev.neura.syncplay.ui.SyncplayViewModel
+import dev.neura.syncplay.ui.SmbBrowserDialog
+import dev.neura.syncplay.ui.SmbPickKind
 import dev.neura.syncplay.ui.theme.SyncplayTheme
+import dev.neura.syncplay.protocol.parseServerEndpoint
 
 class MainActivity : ComponentActivity() {
     private val viewModel: SyncplayViewModel by viewModels()
@@ -57,6 +60,7 @@ private fun SyncplayRoot(
     // Keep the in-app chooser visible through rotation/window recreation. The
     // selected external ActivityResult launcher remains owned by composition.
     var pendingPicker by rememberSaveable { mutableStateOf<PendingPicker?>(null) }
+    var pendingSmbPicker by rememberSaveable { mutableStateOf<SmbPickKind?>(null) }
     val mediaPicker = rememberLauncherForActivityResult(
         contract = OpenWithAppContract(),
         onResult = { picked ->
@@ -78,14 +82,18 @@ private fun SyncplayRoot(
                 pendingPicker = PendingPicker.MEDIA
             },
             onOpenUrl = viewModel::openUrl,
+            onOpenSmbMedia = { pendingSmbPicker = SmbPickKind.MEDIA },
             onOpenSubtitle = {
                 pendingPicker = PendingPicker.SUBTITLE
             },
+            onOpenSmbSubtitle = { pendingSmbPicker = SmbPickKind.SUBTITLE },
+            onSelectSubtitleTrack = viewModel::selectSubtitleTrack,
             onToggleReady = viewModel::toggleReady,
             onSendChat = viewModel::sendChat,
             onChangeRoom = viewModel::changeRoom,
             onDisconnect = viewModel::disconnect,
             onDismissPlaybackError = viewModel::clearPlaybackError,
+            onSetPlaybackEngine = viewModel::setPlaybackEnginePreference,
         )
         else -> ConnectionScreen(
             state = state,
@@ -115,6 +123,24 @@ private fun SyncplayRoot(
                 }
             },
             onDismiss = { pendingPicker = null },
+        )
+    }
+
+    pendingSmbPicker?.let { kind ->
+        val suggestedHost = remember(state.form.serverAddress) {
+            runCatching { parseServerEndpoint(state.form.serverAddress).host }.getOrDefault("")
+        }
+        SmbBrowserDialog(
+            kind = kind,
+            initialHost = suggestedHost,
+            onPicked = { picked ->
+                pendingSmbPicker = null
+                when (kind) {
+                    SmbPickKind.MEDIA -> viewModel.openSmbMedia(picked)
+                    SmbPickKind.SUBTITLE -> viewModel.addSubtitle(picked.uri)
+                }
+            },
+            onDismiss = { pendingSmbPicker = null },
         )
     }
 }

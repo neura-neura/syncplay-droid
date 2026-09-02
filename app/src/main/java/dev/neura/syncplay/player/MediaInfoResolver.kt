@@ -6,6 +6,7 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.CancellationSignal
 import android.provider.OpenableColumns
+import dev.neura.syncplay.smb.SmbUri
 import dev.neura.syncplay.protocol.MediaDescriptor
 import kotlinx.coroutines.CancellationException
 import java.io.File
@@ -29,6 +30,11 @@ data class ResolvedMediaInfo(
     val sizeBytes: Long,
     val durationSeconds: Double,
     val mimeType: String? = null,
+    /**
+     * Whether a provider-backed source exposes a descriptor that supports random access.
+     * [SourceAccessClassification.UNKNOWN] is also used for non-content streams.
+     */
+    val sourceAccess: SourceAccessClassification = SourceAccessClassification.UNKNOWN,
 ) {
     val descriptor: MediaDescriptor
         get() = MediaDescriptor(
@@ -55,13 +61,28 @@ object MediaInfoResolver {
      */
     fun resolve(context: Context, uri: Uri): ResolvedMediaInfo {
         val resolver = context.contentResolver
-        val (queriedName, queriedSize) = queryOpenableMetadata(resolver, uri)
+        val smbScheme = SmbUri.isSmbUri(uri)
+        // Keep malformed private-scheme URIs out of the local-file fallback and do not advertise
+        // them as seekable. The SMB data source will still return the actionable URI error if a
+        // caller tries to prepare one.
+        val directSmb = smbScheme && runCatching { SmbUri.parse(uri) }.isSuccess
+        val (queriedName, queriedSize) = if (smbScheme) {
+            null to null
+        } else {
+            queryOpenableMetadata(resolver, uri)
+        }
         val displayName = queriedName
             ?.takeIf { it.isNotBlank() }
             ?: fallbackDisplayName(uri)
-        val sizeBytes = queriedSize
-            ?.takeIf { it >= 0L }
-            ?: fallbackFileSize(uri)
+        val sizeBytes = if (smbScheme) {
+            // A syncplaysmb path is relative to a remote share. Never pass its URI path to
+            // java.io.File, which would probe an unrelated local path such as /Movies/title.mkv.
+            0L
+        } else {
+            queriedSize
+                ?.takeIf { it >= 0L }
+                ?: fallbackFileSize(uri)
+        }
         // A content provider may be backed by a network filesystem (for example
         // an SMB location exposed by a file manager).  MediaMetadataRetriever
         // performs a synchronous read when given a content URI and some
@@ -69,10 +90,19 @@ object MediaInfoResolver {
         // probe can take longer than Syncplay's heartbeat timeout.  Media3 will
         // discover the duration after prepare(), so leave it unknown here for
         // all provider URIs and keep the control connection independent.
-        val durationSeconds = if (isContentUri(uri)) {
+        val durationSeconds = if (isContentUri(uri) || smbScheme) {
             0.0
         } else {
             queryDurationSeconds(context, uri)
+        }
+        // Probe through a separate, short-lived descriptor.  This never consumes the descriptor
+        // that Media3 will open and callers already invoke resolve() on a worker dispatcher.
+        val sourceAccess = if (directSmb) {
+            SourceAccessClassification.SEEKABLE
+        } else if (smbScheme) {
+            SourceAccessClassification.UNKNOWN
+        } else {
+            ContentUriAccessProbe.probe(resolver, uri)
         }
         return ResolvedMediaInfo(
             uri = uri,
@@ -81,7 +111,12 @@ object MediaInfoResolver {
             durationSeconds = durationSeconds,
             // Media3 and subtitle extension mapping can infer provider content. Avoid a second
             // potentially remote provider call after the bounded metadata query.
-            mimeType = if (isContentUri(uri)) null else runCatching { resolver.getType(uri) }.getOrNull(),
+            mimeType = if (isContentUri(uri) || smbScheme) {
+                null
+            } else {
+                runCatching { resolver.getType(uri) }.getOrNull()
+            },
+            sourceAccess = sourceAccess,
         )
     }
 

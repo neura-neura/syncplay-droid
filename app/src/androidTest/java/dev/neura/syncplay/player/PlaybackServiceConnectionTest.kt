@@ -32,6 +32,49 @@ class PlaybackServiceConnectionTest {
     }
 
     @Test
+    fun mediaSessionCanSwitchToVlcAndBackWithoutDisconnectingController() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val context = instrumentation.targetContext
+        val token = SessionToken(context, ComponentName(context, PlaybackService::class.java))
+        val future = MediaController.Builder(context, token).buildAsync()
+        val controller = future.get(10, TimeUnit.SECONDS)
+
+        try {
+            instrumentation.runOnMainSync {
+                assertTrue(
+                    PlaybackService.setPlaybackEngineNow(
+                        PlaybackEngine.VLC,
+                        PlaybackEngineReason.USER_SELECTION,
+                    ),
+                )
+            }
+            instrumentation.waitForIdleSync()
+            assertTrue(controller.isConnected)
+            assertEquals(PlaybackEngine.VLC, PlaybackEngineStore.state.value.active)
+
+            instrumentation.runOnMainSync {
+                assertTrue(
+                    PlaybackService.setPlaybackEngineNow(
+                        PlaybackEngine.MEDIA3,
+                        PlaybackEngineReason.USER_SELECTION,
+                    ),
+                )
+            }
+            instrumentation.waitForIdleSync()
+            assertTrue(controller.isConnected)
+            assertEquals(PlaybackEngine.MEDIA3, PlaybackEngineStore.state.value.active)
+        } finally {
+            instrumentation.runOnMainSync {
+                PlaybackService.setPlaybackEngineNow(
+                    PlaybackEngine.MEDIA3,
+                    PlaybackEngineReason.USER_SELECTION,
+                )
+                controller.release()
+            }
+        }
+    }
+
+    @Test
     fun exportedServiceRequiresThePrivilegedSystemMediaPermission() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val component = ComponentName(context, PlaybackService::class.java)

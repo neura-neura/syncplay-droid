@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.Looper
 import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.media3.common.AudioAttributes
@@ -12,13 +13,20 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.SeekParameters
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import dev.neura.syncplay.protocol.MediaDescriptor
+import dev.neura.syncplay.player.vlc.LibVlcEngine
+import dev.neura.syncplay.player.vlc.VlcPlayer
+import dev.neura.syncplay.smb.SmbPlaybackEnvironment
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -45,13 +53,16 @@ class PlaybackService : MediaSessionService() {
     private val serviceScope = CoroutineScope(Dispatchers.Main.immediate + serviceJob)
 
     private var exoPlayer: ExoPlayer? = null
+    private var vlcPlayer: VlcPlayer? = null
+    private var currentPlayer: Player? = null
     private var mediaSession: MediaSession? = null
+    private var diagnosticsListener: PlaybackDiagnosticsCollector? = null
     private var openJob: Job? = null
     private val retainedTransientUris = linkedSetOf<Uri>()
 
     /** Player instance used by a MediaController/synchronizer once created. */
-    val playbackPlayer: ExoPlayer?
-        get() = exoPlayer
+    val playbackPlayer: Player?
+        get() = currentPlayer
 
     /** Scope tied to the service lifecycle for metadata/sync work. */
     val playbackScope: CoroutineScope
@@ -70,11 +81,42 @@ class PlaybackService : MediaSessionService() {
             .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
             .build()
 
+        val renderersFactory = DefaultRenderersFactory(this)
+            .setEnableDecoderFallback(true)
+        val mediaSourceFactory = DefaultMediaSourceFactory(
+            SmbPlaybackEnvironment.dataSourceFactory(this),
+        )
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMsForStreaming(
+                STREAMING_MIN_BUFFER_MS,
+                STREAMING_MAX_BUFFER_MS,
+                BUFFER_FOR_PLAYBACK_MS,
+                BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS,
+            )
+            .setBufferDurationsMsForLocalPlayback(
+                LOCAL_MIN_BUFFER_MS,
+                LOCAL_MAX_BUFFER_MS,
+                BUFFER_FOR_PLAYBACK_MS,
+                BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS,
+            )
+            // Media3 classifies content:// providers as local playback. Prioritize buffered time
+            // for SMB-backed MKVs while retaining a byte safety bound for arbitrary HTTP streams.
+            .setPrioritizeTimeOverSizeThresholdsForLocalPlayback(true)
+            .setPrioritizeTimeOverSizeThresholdsForStreaming(true)
+            .setBackBuffer(BACK_BUFFER_DURATION_MS, /* retainBackBufferFromKeyframe = */ true)
+            .build()
+
         val player = ExoPlayer.Builder(this)
-            // EXACT avoids ExoPlayer selecting a nearby keyframe when Syncplay
-            // applies a remote seek.  It is still safe for codecs without
-            // frame-accurate seek; ExoPlayer falls back internally as needed.
-            .setSeekParameters(SeekParameters.EXACT)
+            .setRenderersFactory(renderersFactory)
+            .setMediaSourceFactory(mediaSourceFactory)
+            .setLoadControl(loadControl)
+            // Interactive seeks land quickly on a decodable keyframe. Frame-accurate protocol
+            // corrections opt into EXACT only for the accepted seek, then restore this mode.
+            .setSeekParameters(SeekParameters.CLOSEST_SYNC)
+            // SMB-backed content providers can still require the network while
+            // ExoPlayer reads a content URI. Keep CPU/Wi-Fi awake only while
+            // playback is active.
+            .setWakeMode(C.WAKE_MODE_NETWORK)
             .build()
             .apply {
                 // Let ExoPlayer own AudioFocus and automatically pause when a
@@ -85,7 +127,15 @@ class PlaybackService : MediaSessionService() {
                 addListener(servicePlayerListener)
             }
 
+        // Keep diagnostics on the service-owned player so decoder and renderer callbacks reflect
+        // the actual device pipeline (the Activity only owns a MediaController facade).
+        diagnosticsListener = PlaybackDiagnosticsCollector { player.currentMediaItem }
+        player.addAnalyticsListener(diagnosticsListener!!)
         exoPlayer = player
+        currentPlayer = player
+        activeProcessPlayer = player
+        activeService = this
+        PlaybackEngineStore.setActive(PlaybackEngine.MEDIA3, PlaybackEngineReason.DEFAULT)
         mediaSession = MediaSession.Builder(this, player)
             .setId(SESSION_ID)
             .build()
@@ -132,13 +182,22 @@ class PlaybackService : MediaSessionService() {
         openJob?.cancel()
         openJob = null
         exoPlayer?.removeListener(servicePlayerListener)
+        vlcPlayer?.removeListener(servicePlayerListener)
         // Release the session before the player it references.  Neither object
         // is reused after this point, preventing callbacks into a dead service.
         mediaSession?.release()
         mediaSession = null
+        if (activeProcessPlayer === currentPlayer) activeProcessPlayer = null
+        if (activeService === this) activeService = null
+        diagnosticsListener?.let { listener -> exoPlayer?.removeAnalyticsListener(listener) }
+        diagnosticsListener = null
         exoPlayer?.release()
         exoPlayer = null
+        vlcPlayer?.release()
+        vlcPlayer = null
+        currentPlayer = null
         currentMediaInfo = null
+        PlaybackDiagnosticsStore.clear()
         retainedTransientUris.clear()
         serviceScope.cancel()
         serviceJob.cancel()
@@ -146,7 +205,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun handleIntent(intent: Intent?) {
-        val player = exoPlayer ?: return
+        val player = currentPlayer ?: return
         when (intent?.action) {
             ACTION_OPEN -> {
                 val uri = intent.readUriExtra(EXTRA_URI)
@@ -170,13 +229,17 @@ class PlaybackService : MediaSessionService() {
                 openJob?.cancel()
                 openJob = null
                 currentMediaInfo = null
+                PlaybackDiagnosticsStore.clear()
                 player.stop()
                 player.clearMediaItems()
             }
 
             ACTION_SEEK_TO -> {
                 val positionMs = intent.getLongExtra(EXTRA_POSITION_MS, Long.MIN_VALUE)
-                if (positionMs != Long.MIN_VALUE) player.seekTo(positionMs.coerceAtLeast(0L))
+                if (positionMs != Long.MIN_VALUE) {
+                    player.useClosestSyncSeek()
+                    player.seekTo(positionMs.coerceAtLeast(0L))
+                }
             }
 
             ACTION_SEEK_BY -> {
@@ -187,6 +250,7 @@ class PlaybackService : MediaSessionService() {
                     deltaMs < 0L && current < -deltaMs -> 0L
                     else -> (current + deltaMs).coerceAtLeast(0L)
                 }
+                player.useClosestSyncSeek()
                 player.seekTo(target)
             }
 
@@ -203,8 +267,8 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun openUri(uri: Uri, positionMs: Long, playWhenReady: Boolean) {
-        val player = exoPlayer ?: return
         openJob?.cancel()
+        PlaybackDiagnosticsStore.restart(uri)
         openJob = serviceScope.launch {
             try {
                 val info = withContext(Dispatchers.IO) {
@@ -215,6 +279,17 @@ class PlaybackService : MediaSessionService() {
                 if (!isActive) return@launch
 
                 currentMediaInfo = info
+                val preference = PlaybackEngineStore.state.value.preference
+                val (engine, reason) = selectPlaybackEngine(
+                    preference = preference,
+                    displayName = info.displayName,
+                    mimeType = info.mimeType,
+                    uriPath = info.uri.lastPathSegment ?: info.uri.toString(),
+                )
+                if (!switchPlaybackEngine(engine, reason, preserveCurrentMedia = false)) {
+                    throw IllegalStateException("Unable to select playback engine")
+                }
+                val player = currentPlayer ?: throw IllegalStateException("Playback player unavailable")
                 val mediaItem = MediaItem.Builder()
                     .setMediaId(uri.toString())
                     .setUri(uri)
@@ -243,9 +318,129 @@ class PlaybackService : MediaSessionService() {
             // Media metadata is resolved when OPEN is handled.  A controller
             // may advance/clear the item directly, so clear stale descriptors
             // when there is no current media item.
-            if (mediaItem == null) currentMediaInfo = null
+            val activeItem = currentPlayer?.currentMediaItem
+            if (mediaItem == null && activeItem == null) {
+                currentMediaInfo = null
+                PlaybackDiagnosticsStore.clear()
+            } else if (mediaItem != null && activeItem == mediaItem) {
+                PlaybackDiagnosticsStore.beginIfChanged(mediaItem.localConfiguration?.uri)
+            }
+        }
+
+        override fun onPlayerError(error: PlaybackException) {
+            if (PlaybackEngineStore.state.value.active != PlaybackEngine.VLC) return
+            PlaybackDiagnosticsStore.update { current ->
+                current.copy(
+                    playerErrorCount = current.playerErrorCount + 1,
+                    lastPlayerError = "VLC: ${error.errorCodeName}",
+                )
+            }
         }
     }
+
+    private fun switchPlaybackEngine(
+        requested: PlaybackEngine,
+        reason: PlaybackEngineReason,
+        preserveCurrentMedia: Boolean,
+    ): Boolean {
+        check(Looper.myLooper() == Looper.getMainLooper()) {
+            "Playback engine changes must run on the main looper"
+        }
+        val source = currentPlayer ?: return false
+        if (source.engineType() == requested) {
+            PlaybackEngineStore.setActive(requested, reason)
+            return true
+        }
+
+        val target = when (requested) {
+            PlaybackEngine.MEDIA3 -> exoPlayer
+            PlaybackEngine.VLC -> vlcPlayer ?: run {
+                var createdEngine: LibVlcEngine? = null
+                runCatching {
+                    compatibilityInitializationStage = "LibVLC engine constructor"
+                    val engine = LibVlcEngine(this) { stage ->
+                        compatibilityInitializationStage = "LibVLC $stage"
+                    }
+                    createdEngine = engine
+                    compatibilityInitializationStage = "Media3 VLC wrapper constructor"
+                    VlcPlayer(this, engine).apply {
+                        compatibilityInitializationStage = "audio attributes"
+                        setAudioAttributes(playbackAudioAttributes(), /* handleAudioFocus = */ true)
+                        compatibilityInitializationStage = "listener"
+                        addListener(servicePlayerListener)
+                    }.also {
+                        createdEngine = null
+                        vlcPlayer = it
+                    }
+                }.onFailure { error ->
+                    runCatching { createdEngine?.close() }
+                    Log.w(
+                        TAG,
+                        "Unable to initialize compatibility engine during " +
+                            "$compatibilityInitializationStage (${error.javaClass.simpleName})",
+                    )
+                }.getOrNull()
+            }
+        } ?: return false
+
+        val item = source.currentMediaItem.takeIf { preserveCurrentMedia }
+        val positionMs = source.currentPosition.coerceAtLeast(0L)
+        val shouldPlay = source.playWhenReady
+        val parameters = source.playbackParameters
+        val trackParameters = runCatching { source.trackSelectionParameters }.getOrNull()
+
+        var sessionCommitted = false
+        return runCatching {
+            target.stop()
+            target.clearMediaItems()
+            if (item != null) {
+                trackParameters?.takeIf {
+                    target.isCommandAvailable(Player.COMMAND_SET_TRACK_SELECTION_PARAMETERS)
+                }?.let { target.trackSelectionParameters = it }
+                target.playbackParameters = parameters
+                target.setMediaItem(item, positionMs)
+                target.playerError?.let { throw it }
+                target.prepare()
+                target.playWhenReady = shouldPlay
+            }
+
+            mediaSession?.setPlayer(target) ?: error("MediaSession unavailable")
+            sessionCommitted = true
+            currentPlayer = target
+            activeProcessPlayer = target
+            PlaybackEngineStore.setActive(requested, reason)
+
+            // Ignore the old player's transition-to-empty callback: the target is now the source
+            // of truth and already owns the preserved item (when requested).
+            runCatching { source.removeListener(servicePlayerListener) }
+            runCatching { source.stop() }
+            runCatching { source.clearMediaItems() }
+            runCatching { source.addListener(servicePlayerListener) }
+            true
+        }.onFailure { error ->
+            if (!sessionCommitted) {
+                // Keep the old session player/media intact and release any descriptor opened by
+                // the rejected target before reporting the failed switch.
+                runCatching { target.stop() }
+                runCatching { target.clearMediaItems() }
+            }
+            Log.w(TAG, "Unable to change playback engine (${error.javaClass.simpleName})")
+        }.getOrDefault(false)
+    }
+
+    private fun Player.engineType(): PlaybackEngine =
+        if (this is VlcPlayer) PlaybackEngine.VLC else PlaybackEngine.MEDIA3
+
+    private fun Player.useClosestSyncSeek() {
+        if (this is ExoPlayer) setSeekParameters(SeekParameters.CLOSEST_SYNC)
+    }
+
+    private fun playbackAudioAttributes(): AudioAttributes = AudioAttributes.Builder()
+        .setUsage(C.USAGE_MEDIA)
+        .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+        .build()
+
+    private var compatibilityInitializationStage: String = "not started"
 
     companion object {
         const val ACTION_OPEN = "dev.neura.syncplay.action.OPEN"
@@ -270,9 +465,20 @@ class PlaybackService : MediaSessionService() {
         internal const val EXTRA_COMMAND_TOKEN = "dev.neura.syncplay.extra.COMMAND_TOKEN"
         private const val MIN_RATE = 0.25f
         private const val MAX_RATE = 4f
+        private const val LOCAL_MIN_BUFFER_MS = 20_000
+        private const val LOCAL_MAX_BUFFER_MS = 120_000
+        private const val STREAMING_MIN_BUFFER_MS = 30_000
+        private const val STREAMING_MAX_BUFFER_MS = 120_000
+        private const val BUFFER_FOR_PLAYBACK_MS = 5_000
+        private const val BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 15_000
+        private const val BACK_BUFFER_DURATION_MS = 30_000
         private const val TAG = "PlaybackService"
 
         private val PROCESS_COMMAND_TOKEN: String = UUID.randomUUID().toString()
+        @Volatile
+        private var activeProcessPlayer: Player? = null
+        @Volatile
+        private var activeService: PlaybackService? = null
         private val INTERNAL_COMMAND_ACTIONS = setOf(
             ACTION_OPEN,
             ACTION_PLAY,
@@ -314,6 +520,54 @@ class PlaybackService : MediaSessionService() {
             applicationPackage: String,
             isTrusted: Boolean,
         ): Boolean = isTrusted || controllerPackage == applicationPackage
+
+        /**
+         * Apply one frame-accurate protocol correction synchronously to the process-local player.
+         *
+         * This intentionally is not an Intent command: a queued command could arrive after the
+         * user has replaced the media item. The identity check and application-looper requirement
+         * make the acknowledgement correspond to the exact player/item that accepted the seek.
+         */
+        internal fun seekToSynchronizedNow(
+            expectedMediaIdentity: String?,
+            positionMs: Long,
+        ): Boolean {
+            val player = activeProcessPlayer ?: return false
+            if (Looper.myLooper() != player.applicationLooper) return false
+            val item = player.currentMediaItem ?: return false
+            val actualIdentity = item.mediaId.takeIf { it.isNotBlank() }
+                ?: item.localConfiguration?.uri?.toString()
+            if (expectedMediaIdentity.isNullOrBlank() || actualIdentity != expectedMediaIdentity) {
+                return false
+            }
+            if (!player.isCommandAvailable(Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM)) return false
+            return runCatching {
+                if (player is ExoPlayer) {
+                    player.setSeekParameters(SeekParameters.EXACT)
+                    try {
+                        player.seekTo(positionMs.coerceAtLeast(0L))
+                    } finally {
+                        player.setSeekParameters(SeekParameters.CLOSEST_SYNC)
+                    }
+                } else {
+                    player.seekTo(positionMs.coerceAtLeast(0L))
+                }
+                true
+            }.getOrDefault(false)
+        }
+
+        /** Replace the session backend synchronously without disconnecting its MediaController. */
+        internal fun setPlaybackEngineNow(
+            engine: PlaybackEngine,
+            reason: PlaybackEngineReason,
+            preserveCurrentMedia: Boolean = true,
+        ): Boolean {
+            val service = activeService ?: return false
+            if (Looper.myLooper() != Looper.getMainLooper()) return false
+            return runCatching {
+                service.switchPlaybackEngine(engine, reason, preserveCurrentMedia)
+            }.getOrDefault(false)
+        }
 
         /** Start/reuse the service and open a SAF/file URI. */
         fun open(

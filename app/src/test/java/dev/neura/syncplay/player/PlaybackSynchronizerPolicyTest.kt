@@ -95,6 +95,35 @@ class PlaybackSynchronizerPolicyTest {
     }
 
     @Test
+    fun automaticCorrectionDoesNotRestartAPlayerThatIsBuffering() {
+        assertEquals(
+            false,
+            canSeekForRemoteCorrection(
+                playbackState = androidx.media3.common.Player.STATE_BUFFERING,
+                forceSeek = false,
+            ),
+        )
+        assertEquals(
+            true,
+            canSeekForRemoteCorrection(
+                playbackState = androidx.media3.common.Player.STATE_READY,
+                forceSeek = false,
+            ),
+        )
+    }
+
+    @Test
+    fun explicitRemoteSeekIsStillAllowedWhileBuffering() {
+        assertEquals(
+            true,
+            canSeekForRemoteCorrection(
+                playbackState = androidx.media3.common.Player.STATE_BUFFERING,
+                forceSeek = true,
+            ),
+        )
+    }
+
+    @Test
     fun idleEndedAndFatalErrorAreNeverAdvertisedAsPlaying() {
         assertTrue(isEffectivelyPaused(true, androidx.media3.common.Player.STATE_IDLE, false))
         assertTrue(isEffectivelyPaused(true, androidx.media3.common.Player.STATE_ENDED, false))
