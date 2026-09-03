@@ -8,7 +8,7 @@ import androidx.media3.common.TrackGroup
 import androidx.media3.common.Tracks
 import java.util.Locale
 
-/** Numeric track kinds used by LibVLC's [org.videolan.libvlc.interfaces.IMedia.Track.Type]. */
+/** Numeric track kinds shared by the libmpv adapter and Media3 facade. */
 object VlcTrackType {
     const val UNKNOWN = -1
     const val AUDIO = 0
@@ -16,7 +16,7 @@ object VlcTrackType {
     const val TEXT = 2
 }
 
-/** A small, dependency-light representation of a LibVLC elementary stream. */
+/** A small, dependency-light representation of a libmpv elementary stream. */
 data class VlcTrackInfo(
     val id: Int,
     val type: Int,
@@ -39,7 +39,7 @@ data class VlcTrackInfo(
     val rotationDegrees: Int = 0,
 )
 
-/** Current streams and selected LibVLC ids. Kept as a value object for deterministic tests. */
+/** Current streams and selected libmpv ids. Kept as a value object for deterministic tests. */
 data class VlcTrackSnapshot(
     val tracks: List<VlcTrackInfo> = emptyList(),
     val selectedAudioId: Int = -1,
@@ -49,22 +49,23 @@ data class VlcTrackSnapshot(
 
 /** Stable id used in Media3 [Format.id] and track-selection overrides. */
 internal fun VlcTrackInfo.media3FormatId(): String =
-    externalId?.takeIf { it.isNotBlank() } ?: "vlc:$type:$id"
+    externalId?.takeIf { it.isNotBlank() } ?: "mpv:$type:$id"
 
-/** Resolve a Media3 format id back to the LibVLC stream id. */
+/** Resolve a Media3 format id back to the libmpv stream id. */
 internal fun VlcTrackSnapshot.engineTrackId(formatId: String?): Int? {
     if (formatId.isNullOrBlank()) return null
     tracks.firstOrNull { it.media3FormatId() == formatId }?.let { return it.id }
     val parts = formatId.split(':')
-    if (parts.size == 3 && parts[0] == "vlc") return parts[2].toIntOrNull()
+    if (parts.size == 3 && parts[0] == "mpv") return parts[2].toIntOrNull()
     return null
 }
 
 /**
- * Convert LibVLC stream metadata to Media3's immutable [Tracks] representation.
+ * Convert libmpv stream metadata to Media3's immutable [Tracks] representation.
  *
- * LibVLC exposes one flat list while Media3 exposes groups. A group is emitted per stream kind;
- * support is advertised only for codecs for which Media3 can describe the stream. LibVLC remains
+ * libmpv exposes one flat list while Media3 requires every TrackGroup to share language/role
+ * metadata. A one-track group is therefore emitted per stream; support is advertised only for
+ * codecs for which Media3 can describe the stream. MPV remains
  * the decoder, so this is metadata for controllers and selectors rather than a decoder claim.
  */
 @SuppressLint("UnsafeOptInUsageError") // This object is the intentional Media3 metadata adapter.
@@ -78,26 +79,23 @@ object VlcTrackMapper {
 
         val groups = snapshot.tracks
             .filter { it.type == VlcTrackType.AUDIO || it.type == VlcTrackType.VIDEO || it.type == VlcTrackType.TEXT }
-            .groupBy { it.type }
-            .toSortedMap()
-            .map { (type, entries) ->
-                val formats = entries.map(::toFormat).toTypedArray()
-                val support = IntArray(formats.size) { index ->
-                    if (mimeTypeFor(entries[index]) != null && mimeTypeFor(entries[index]) != MimeTypes.VIDEO_UNKNOWN &&
-                        mimeTypeFor(entries[index]) != MimeTypes.AUDIO_UNKNOWN && mimeTypeFor(entries[index]) != MimeTypes.TEXT_UNKNOWN
-                    ) C.FORMAT_HANDLED else C.FORMAT_UNSUPPORTED_TYPE
-                }
-                val selectedId = when (type) {
+            .sortedWith(compareBy(VlcTrackInfo::type, VlcTrackInfo::id))
+            .map { entry ->
+                val format = toFormat(entry)
+                val mimeType = mimeTypeFor(entry)
+                val support = if (mimeType != null && mimeType != MimeTypes.VIDEO_UNKNOWN &&
+                    mimeType != MimeTypes.AUDIO_UNKNOWN && mimeType != MimeTypes.TEXT_UNKNOWN
+                ) C.FORMAT_HANDLED else C.FORMAT_UNSUPPORTED_TYPE
+                val selectedId = when (entry.type) {
                     VlcTrackType.AUDIO -> snapshot.selectedAudioId
                     VlcTrackType.VIDEO -> snapshot.selectedVideoId
                     else -> snapshot.selectedTextId
                 }
-                val selected = BooleanArray(entries.size) { entries[it].id == selectedId }
                 Tracks.Group(
-                    TrackGroup("vlc:${typeName(type)}", *formats),
+                    TrackGroup("mpv:${typeName(entry.type)}:${entry.id}", format),
                     false,
-                    support,
-                    selected,
+                    intArrayOf(support),
+                    booleanArrayOf(entry.id == selectedId),
                 )
             }
         return Tracks(groups)

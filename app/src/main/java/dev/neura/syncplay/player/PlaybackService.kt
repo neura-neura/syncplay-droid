@@ -24,7 +24,7 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import dev.neura.syncplay.protocol.MediaDescriptor
-import dev.neura.syncplay.player.vlc.LibVlcEngine
+import dev.neura.syncplay.player.vlc.LibMpvEngine
 import dev.neura.syncplay.player.vlc.VlcPlayer
 import dev.neura.syncplay.smb.SmbPlaybackEnvironment
 import kotlinx.coroutines.CancellationException
@@ -53,7 +53,7 @@ class PlaybackService : MediaSessionService() {
     private val serviceScope = CoroutineScope(Dispatchers.Main.immediate + serviceJob)
 
     private var exoPlayer: ExoPlayer? = null
-    private var vlcPlayer: VlcPlayer? = null
+    private var mpvPlayer: VlcPlayer? = null
     private var currentPlayer: Player? = null
     private var mediaSession: MediaSession? = null
     private var diagnosticsListener: PlaybackDiagnosticsCollector? = null
@@ -182,7 +182,7 @@ class PlaybackService : MediaSessionService() {
         openJob?.cancel()
         openJob = null
         exoPlayer?.removeListener(servicePlayerListener)
-        vlcPlayer?.removeListener(servicePlayerListener)
+        mpvPlayer?.removeListener(servicePlayerListener)
         // Release the session before the player it references.  Neither object
         // is reused after this point, preventing callbacks into a dead service.
         mediaSession?.release()
@@ -193,8 +193,8 @@ class PlaybackService : MediaSessionService() {
         diagnosticsListener = null
         exoPlayer?.release()
         exoPlayer = null
-        vlcPlayer?.release()
-        vlcPlayer = null
+        mpvPlayer?.release()
+        mpvPlayer = null
         currentPlayer = null
         currentMediaInfo = null
         PlaybackDiagnosticsStore.clear()
@@ -284,7 +284,8 @@ class PlaybackService : MediaSessionService() {
                     preference = preference,
                     displayName = info.displayName,
                     mimeType = info.mimeType,
-                    uriPath = info.uri.lastPathSegment ?: info.uri.toString(),
+                    uriPath = info.uri.toString(),
+                    sourceAccess = info.sourceAccess,
                 )
                 if (!switchPlaybackEngine(engine, reason, preserveCurrentMedia = false)) {
                     throw IllegalStateException("Unable to select playback engine")
@@ -328,11 +329,11 @@ class PlaybackService : MediaSessionService() {
         }
 
         override fun onPlayerError(error: PlaybackException) {
-            if (PlaybackEngineStore.state.value.active != PlaybackEngine.VLC) return
+            if (PlaybackEngineStore.state.value.active != PlaybackEngine.MPV) return
             PlaybackDiagnosticsStore.update { current ->
                 current.copy(
                     playerErrorCount = current.playerErrorCount + 1,
-                    lastPlayerError = "VLC: ${error.errorCodeName}",
+                    lastPlayerError = "MPV: ${error.errorCodeName}",
                 )
             }
         }
@@ -354,15 +355,15 @@ class PlaybackService : MediaSessionService() {
 
         val target = when (requested) {
             PlaybackEngine.MEDIA3 -> exoPlayer
-            PlaybackEngine.VLC -> vlcPlayer ?: run {
-                var createdEngine: LibVlcEngine? = null
+            PlaybackEngine.MPV -> mpvPlayer ?: run {
+                var createdEngine: LibMpvEngine? = null
                 runCatching {
-                    compatibilityInitializationStage = "LibVLC engine constructor"
-                    val engine = LibVlcEngine(this) { stage ->
-                        compatibilityInitializationStage = "LibVLC $stage"
+                    compatibilityInitializationStage = "libmpv engine constructor"
+                    val engine = LibMpvEngine(this) { stage ->
+                        compatibilityInitializationStage = "libmpv $stage"
                     }
                     createdEngine = engine
-                    compatibilityInitializationStage = "Media3 VLC wrapper constructor"
+                    compatibilityInitializationStage = "Media3 MPV wrapper constructor"
                     VlcPlayer(this, engine).apply {
                         compatibilityInitializationStage = "audio attributes"
                         setAudioAttributes(playbackAudioAttributes(), /* handleAudioFocus = */ true)
@@ -370,7 +371,7 @@ class PlaybackService : MediaSessionService() {
                         addListener(servicePlayerListener)
                     }.also {
                         createdEngine = null
-                        vlcPlayer = it
+                        mpvPlayer = it
                     }
                 }.onFailure { error ->
                     runCatching { createdEngine?.close() }
@@ -429,7 +430,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun Player.engineType(): PlaybackEngine =
-        if (this is VlcPlayer) PlaybackEngine.VLC else PlaybackEngine.MEDIA3
+        if (this is VlcPlayer) PlaybackEngine.MPV else PlaybackEngine.MEDIA3
 
     private fun Player.useClosestSyncSeek() {
         if (this is ExoPlayer) setSeekParameters(SeekParameters.CLOSEST_SYNC)

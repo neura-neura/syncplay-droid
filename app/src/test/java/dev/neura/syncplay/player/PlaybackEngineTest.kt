@@ -7,15 +7,16 @@ import org.junit.Test
 
 class PlaybackEngineTest {
     @Test
-    fun automaticUsesVlcForMatroskaDisplayNameFromContentProvider() {
+    fun automaticUsesMpvForMatroskaDisplayNameFromContentProvider() {
         val selected = selectPlaybackEngine(
             preference = PlaybackEnginePreference.AUTOMATIC,
             displayName = "Movie.Main10.MKV",
             mimeType = "application/octet-stream",
-            uriPath = "document/42",
+            uriPath = "content://provider/document/42",
+            sourceAccess = SourceAccessClassification.SEEKABLE,
         )
 
-        assertEquals(PlaybackEngine.VLC, selected.first)
+        assertEquals(PlaybackEngine.MPV, selected.first)
         assertEquals(PlaybackEngineReason.MATROSKA_COMPATIBILITY, selected.second)
     }
 
@@ -39,9 +40,50 @@ class PlaybackEngineTest {
             selectPlaybackEngine(PlaybackEnginePreference.MEDIA3, "movie.mkv", null, "/movie.mkv").first,
         )
         assertEquals(
-            PlaybackEngine.VLC,
-            selectPlaybackEngine(PlaybackEnginePreference.VLC, "movie.mp4", "video/mp4", "/movie.mp4").first,
+            PlaybackEngine.MPV,
+            selectPlaybackEngine(PlaybackEnginePreference.MPV, "movie.mp4", "video/mp4", "/movie.mp4").first,
         )
+    }
+
+    @Test
+    fun directSmbKeepsSeekableMedia3DataSourceEvenWhenMpvWasRequested() {
+        val selected = selectPlaybackEngine(
+            PlaybackEnginePreference.MPV,
+            "movie.mkv",
+            "video/x-matroska",
+            "syncplaysmb://profile/share/movie.mkv",
+        )
+
+        assertEquals(PlaybackEngine.MEDIA3, selected.first)
+        assertEquals(PlaybackEngineReason.DIRECT_SMB_COMPATIBILITY, selected.second)
+    }
+
+    @Test
+    fun sequentialDocumentProviderFallsBackToMedia3InsteadOfGivingMpvAnUnseekablePipe() {
+        val selected = selectPlaybackEngine(
+            PlaybackEnginePreference.AUTOMATIC,
+            "movie.mkv",
+            "video/x-matroska",
+            "content://provider/movie",
+            SourceAccessClassification.SEQUENTIAL,
+        )
+
+        assertEquals(PlaybackEngine.MEDIA3, selected.first)
+        assertEquals(PlaybackEngineReason.SEQUENTIAL_PROVIDER_COMPATIBILITY, selected.second)
+    }
+
+    @Test
+    fun automaticDoesNotAssumeAnUnknownDocumentProviderIsSeekable() {
+        val selected = selectPlaybackEngine(
+            PlaybackEnginePreference.AUTOMATIC,
+            "movie.mkv",
+            "video/x-matroska",
+            "content://provider/movie",
+            SourceAccessClassification.UNKNOWN,
+        )
+
+        assertEquals(PlaybackEngine.MEDIA3, selected.first)
+        assertEquals(PlaybackEngineReason.UNVERIFIED_PROVIDER_COMPATIBILITY, selected.second)
     }
 
     @Test

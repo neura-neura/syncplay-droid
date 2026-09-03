@@ -177,7 +177,7 @@ class ExpressiveScreensTest {
                         effectiveRoom = "movies",
                         playbackEngine = PlaybackEngineState(
                             preference = PlaybackEnginePreference.AUTOMATIC,
-                            active = PlaybackEngine.VLC,
+                            active = PlaybackEngine.MPV,
                             reason = PlaybackEngineReason.MATROSKA_COMPATIBILITY,
                         ),
                     ),
@@ -196,7 +196,7 @@ class ExpressiveScreensTest {
 
         composeRule.onNodeWithContentDescription("Más opciones").performClick()
         composeRule.onNodeWithText("Motor de reproducción").performClick()
-        composeRule.onNodeWithText("Motor activo: VLC").assertIsDisplayed()
+        composeRule.onNodeWithText("Motor activo: MPV").assertIsDisplayed()
         composeRule.onNodeWithText("Automático (recomendado)").assertIsDisplayed()
         composeRule.onNodeWithText("AndroidX Media3").performClick()
 

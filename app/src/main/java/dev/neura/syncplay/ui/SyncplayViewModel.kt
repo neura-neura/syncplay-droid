@@ -531,11 +531,12 @@ class SyncplayViewModel(
                 preference = preference,
                 displayName = info.displayName,
                 mimeType = info.mimeType,
-                uriPath = info.uri.lastPathSegment ?: info.uri.toString(),
+                uriPath = info.uri.toString(),
+                sourceAccess = info.sourceAccess,
             )
         } else {
             when (preference) {
-                PlaybackEnginePreference.VLC -> PlaybackEngine.VLC to PlaybackEngineReason.USER_SELECTION
+                PlaybackEnginePreference.MPV -> PlaybackEngine.MPV to PlaybackEngineReason.USER_SELECTION
                 PlaybackEnginePreference.MEDIA3,
                 PlaybackEnginePreference.AUTOMATIC,
                 -> PlaybackEngine.MEDIA3 to if (preference == PlaybackEnginePreference.MEDIA3) {
@@ -876,7 +877,8 @@ class SyncplayViewModel(
             preference = preference,
             displayName = info.displayName,
             mimeType = info.mimeType,
-            uriPath = info.uri.lastPathSegment ?: info.uri.toString(),
+            uriPath = info.uri.toString(),
+            sourceAccess = info.sourceAccess,
         )
         PlaybackService.setPlaybackEngineNow(
             engine = engine,

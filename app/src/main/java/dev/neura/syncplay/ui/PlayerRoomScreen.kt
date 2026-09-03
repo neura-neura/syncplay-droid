@@ -134,6 +134,7 @@ import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
+import dev.neura.syncplay.R
 import dev.neura.syncplay.protocol.ChatEntry
 import dev.neura.syncplay.protocol.ConnectionStatus
 import dev.neura.syncplay.protocol.RoomUser
@@ -192,6 +193,7 @@ fun PlayerRoomScreen(
     if (fullscreenActive) {
         FullscreenPlayerScreen(
             player = state.player,
+            playbackEngine = state.playbackEngine.active,
             isMediaLoading = state.isMediaLoading,
             isSubtitleLoading = state.isSubtitleLoading,
             onFullscreenChange = { isFullscreen = it },
@@ -727,7 +729,7 @@ private fun PlaybackEngineDialog(
         Triple(
             PlaybackEnginePreference.AUTOMATIC,
             "Automático (recomendado)",
-            "Usa VLC para MKV exigentes y AndroidX Media3 para los demás formatos.",
+            "Usa MPV para MKV exigentes y AndroidX Media3 para los demás formatos.",
         ),
         Triple(
             PlaybackEnginePreference.MEDIA3,
@@ -735,9 +737,9 @@ private fun PlaybackEngineDialog(
             "Motor nativo principal; ideal para MP4, HLS y DASH.",
         ),
         Triple(
-            PlaybackEnginePreference.VLC,
-            "VLC (compatibilidad)",
-            "Alternativa para HEVC Main10, MKV, audio multicanal o decodificadores problemáticos.",
+            PlaybackEnginePreference.MPV,
+            "MPV (alto rendimiento)",
+            "MediaCodec con salida GPU, respaldo por software y subtítulos libass.",
         ),
     )
     AlertDialog(
@@ -746,7 +748,7 @@ private fun PlaybackEngineDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(
-                    "Motor activo: ${if (state.active == PlaybackEngine.VLC) "VLC" else "AndroidX Media3"}",
+                    "Motor activo: ${if (state.active == PlaybackEngine.MPV) "MPV" else "AndroidX Media3"}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(bottom = 8.dp),
@@ -785,14 +787,17 @@ private fun PlaybackEngineDialog(
 }
 
 private fun playbackEngineSummary(state: PlaybackEngineState): String {
-    val active = if (state.active == PlaybackEngine.VLC) "VLC" else "AndroidX Media3"
+    val active = if (state.active == PlaybackEngine.MPV) "MPV" else "AndroidX Media3"
     val preference = when (state.preference) {
         PlaybackEnginePreference.AUTOMATIC -> "automático"
         PlaybackEnginePreference.MEDIA3 -> "selección manual Media3"
-        PlaybackEnginePreference.VLC -> "selección manual VLC"
+        PlaybackEnginePreference.MPV -> "selección manual MPV"
     }
     val reason = when (state.reason) {
         PlaybackEngineReason.MATROSKA_COMPATIBILITY -> "compatibilidad MKV/HEVC"
+        PlaybackEngineReason.DIRECT_SMB_COMPATIBILITY -> "SMB directo"
+        PlaybackEngineReason.SEQUENTIAL_PROVIDER_COMPATIBILITY -> "proveedor sin acceso aleatorio"
+        PlaybackEngineReason.UNVERIFIED_PROVIDER_COMPATIBILITY -> "acceso del proveedor no verificado"
         PlaybackEngineReason.USER_SELECTION -> "elegido por ti"
         PlaybackEngineReason.DEFAULT -> "predeterminado"
     }
@@ -866,9 +871,9 @@ private fun diagnosticsAssessment(
     return when {
         diagnostics.playerErrorCount > 0 ->
             "El reproductor informó un fallo; revisa el último error debajo."
-        engine.active == PlaybackEngine.VLC ->
-            "Compatibilidad VLC activa. Los contadores internos del decodificador Media3 no " +
-                "están disponibles en este modo."
+        engine.active == PlaybackEngine.MPV ->
+            "MPV activo: MediaCodec/GPU para video y libass para subtítulos. Los contadores " +
+                "internos del decodificador Media3 no están disponibles en este modo."
         diagnostics.loadErrorCount > 0 || diagnostics.bufferingCount >= 3 ->
             "La fuente o la red no están alimentando el buffer de forma estable. Usa SMB directo."
         diagnostics.droppedVideoFrames >= 24 || (averageOffsetMs != null && averageOffsetMs < -30.0) ->
@@ -1184,6 +1189,7 @@ private fun PlayerPane(
         if (player != null && state.media != null) {
             Media3PlayerView(
                 player = player,
+                playbackEngine = state.playbackEngine.active,
                 isFullscreen = false,
                 controlsEnabled = !state.isMediaLoading,
                 onFullscreenChange = onFullscreenChange,
@@ -1334,9 +1340,29 @@ private fun PlayerPane(
 }
 
 @androidx.annotation.OptIn(UnstableApi::class)
+internal fun bindPlayerViewToEngine(
+    playerView: PlayerView,
+    player: Player,
+    playbackEngine: PlaybackEngine,
+) {
+    // MediaController remains the same Java object when MediaSession swaps its backing player.
+    // Reattaching makes it send the current Surface to the new decoder instead of leaving it on
+    // the previous one (the symptom is audio playing behind a permanently black video area).
+    if (
+        playerView.player !== player ||
+        playerView.getTag(R.id.player_view_playback_engine) != playbackEngine
+    ) {
+        playerView.player = null
+        playerView.setTag(R.id.player_view_playback_engine, playbackEngine)
+        playerView.player = player
+    }
+}
+
+@androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 private fun Media3PlayerView(
     player: Player,
+    playbackEngine: PlaybackEngine,
     isFullscreen: Boolean,
     controlsEnabled: Boolean = true,
     onFullscreenChange: (Boolean) -> Unit,
@@ -1353,14 +1379,16 @@ private fun Media3PlayerView(
                 setShowShuffleButton(false)
                 setShowNextButton(false)
                 setShowPreviousButton(false)
+                setKeepContentOnPlayerReset(true)
+                setEnableComposeSurfaceSyncWorkaround(true)
                 keepScreenOn = true
-                this.player = player
+                bindPlayerViewToEngine(this, player, playbackEngine)
                 setFullscreenButtonClickListener(onFullscreenChange)
                 setFullscreenButtonState(isFullscreen)
             }
         },
         update = {
-            it.player = player
+            bindPlayerViewToEngine(it, player, playbackEngine)
             it.useController = controlsEnabled
             it.setShowSubtitleButton(false)
             it.setFullscreenButtonClickListener(onFullscreenChange)
@@ -1377,6 +1405,7 @@ private fun Media3PlayerView(
 @Composable
 private fun FullscreenPlayerScreen(
     player: Player?,
+    playbackEngine: PlaybackEngine,
     isMediaLoading: Boolean,
     isSubtitleLoading: Boolean,
     onFullscreenChange: (Boolean) -> Unit,
@@ -1389,6 +1418,7 @@ private fun FullscreenPlayerScreen(
         if (player != null) {
             Media3PlayerView(
                 player = player,
+                playbackEngine = playbackEngine,
                 isFullscreen = true,
                 controlsEnabled = !isMediaLoading,
                 onFullscreenChange = onFullscreenChange,

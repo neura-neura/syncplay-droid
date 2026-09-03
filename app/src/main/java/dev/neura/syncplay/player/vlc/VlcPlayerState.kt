@@ -2,7 +2,7 @@ package dev.neura.syncplay.player.vlc
 
 import androidx.media3.common.Player
 
-/** LibVLC's coarse playback lifecycle, deliberately free of Android classes for unit testing. */
+/** libmpv's coarse playback lifecycle, deliberately free of Android classes for unit testing. */
 enum class VlcPlaybackPhase {
     IDLE,
     OPENING,
@@ -14,7 +14,7 @@ enum class VlcPlaybackPhase {
     ERROR,
 }
 
-/** Map LibVLC lifecycle values to the state contract expected by MediaSession and PlayerView. */
+/** Map libmpv lifecycle values to the state contract expected by MediaSession and PlayerView. */
 internal fun VlcPlaybackPhase.toMedia3PlaybackState(): Int = when (this) {
     VlcPlaybackPhase.OPENING,
     VlcPlaybackPhase.BUFFERING,
@@ -31,7 +31,7 @@ internal fun VlcPlaybackPhase.toMedia3PlaybackState(): Int = when (this) {
     -> Player.STATE_IDLE
 }
 
-/** LibVLC reports a playing flag separately from the requested play intent. */
+/** libmpv reports a playing flag separately from the requested play intent. */
 internal fun VlcPlaybackPhase.isPlaying(playWhenReady: Boolean): Boolean =
     playWhenReady && this == VlcPlaybackPhase.PLAYING
 
@@ -49,12 +49,15 @@ internal fun VlcPlaybackPhase.normalizedPlayWhenReady(requested: Boolean): Boole
 /** A pure event payload shared by the engine and the Media3 adapter. */
 data class VlcEngineEvent(
     val kind: Kind,
+    /** True only after libmpv confirms that playback restarted and a frame can be presented. */
+    val firstFrameRendered: Boolean = false,
     val positionMs: Long? = null,
     val durationMs: Long? = null,
     val bufferingPercent: Float? = null,
     val seekable: Boolean? = null,
     val tracks: VlcTrackSnapshot? = null,
     val videoSize: VlcVideoSize? = null,
+    val surfaceSize: VlcSurfaceSize? = null,
     val error: Throwable? = null,
 ) {
     enum class Kind {
@@ -71,6 +74,7 @@ data class VlcEngineEvent(
         POSITION_CHANGED,
         SEEKABLE_CHANGED,
         VOUT,
+        SURFACE_SIZE_CHANGED,
         TRACKS_CHANGED,
     }
 }
@@ -81,3 +85,5 @@ data class VlcVideoSize(
     val pixelWidthHeightRatio: Float = 1f,
     val rotationDegrees: Int = 0,
 )
+
+data class VlcSurfaceSize(val width: Int, val height: Int)

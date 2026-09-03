@@ -43,14 +43,14 @@ class PlaybackServiceConnectionTest {
             instrumentation.runOnMainSync {
                 assertTrue(
                     PlaybackService.setPlaybackEngineNow(
-                        PlaybackEngine.VLC,
+                        PlaybackEngine.MPV,
                         PlaybackEngineReason.USER_SELECTION,
                     ),
                 )
             }
             instrumentation.waitForIdleSync()
             assertTrue(controller.isConnected)
-            assertEquals(PlaybackEngine.VLC, PlaybackEngineStore.state.value.active)
+            assertEquals(PlaybackEngine.MPV, PlaybackEngineStore.state.value.active)
 
             instrumentation.runOnMainSync {
                 assertTrue(

@@ -33,7 +33,7 @@ import com.google.common.util.concurrent.ListenableFuture
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Media3 [Player] facade backed by LibVLC. The facade is intentionally single-item: Syncplay
+ * Media3 [Player] facade backed by libmpv. The facade is intentionally single-item: Syncplay
  * synchronizes one movie at a time, while MediaSession and PlayerView continue to consume the
  * standard Media3 callbacks and state model.
  */
@@ -41,7 +41,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 @SuppressLint("UnsafeOptInUsageError") // SimpleBasePlayer is the intended Media3 adapter boundary.
 class VlcPlayer(
     context: Context,
-    private val engine: VlcPlayerEngine = LibVlcEngine(context),
+    private val engine: VlcPlayerEngine = LibMpvEngine(context),
     looper: Looper = Looper.getMainLooper(),
     private val nowMs: () -> Long = { SystemClock.elapsedRealtime() },
 ) : SimpleBasePlayer(looper), AutoCloseable {
@@ -69,6 +69,9 @@ class VlcPlayer(
     private var handleAudioFocus = false
     private var volume = 1f
     private var videoSize = VideoSize.UNKNOWN
+    private var surfaceSize = Size.UNKNOWN
+    /** One-shot event that removes PlayerView's shutter over the native MPV surface. */
+    private var newlyRenderedFirstFrame = false
     private var pendingDiscontinuity: Pair<Int, Long>? = null
     private var surfaceOutput: Any? = null
     private var audioFocusRequest: AudioFocusRequest? = null
@@ -147,8 +150,9 @@ class VlcPlayer(
             .setVolume(volume)
             .setUnmuteVolume(volume)
             .setVideoSize(videoSize)
+            .setNewlyRenderedFirstFrame(newlyRenderedFirstFrame)
             .setCurrentCues(CueGroup.EMPTY_TIME_ZERO)
-            .setSurfaceSize(Size.UNKNOWN)
+            .setSurfaceSize(surfaceSize)
             .setPlaylistMetadata(currentItem?.mediaMetadata ?: MediaMetadata.EMPTY)
             .setContentPositionMs(currentPosition)
             .setContentBufferedPositionMs(SimpleBasePlayer.PositionSupplier.getConstant(bufferedPositionMs))
@@ -168,6 +172,7 @@ class VlcPlayer(
             builder.setPositionDiscontinuity(reason, position)
             pendingDiscontinuity = null
         }
+        newlyRenderedFirstFrame = false
         return builder.build()
     }
 
@@ -295,11 +300,13 @@ class VlcPlayer(
         trackSnapshot = VlcTrackSnapshot()
         tracks = Tracks.EMPTY
         videoSize = VideoSize.UNKNOWN
+        surfaceSize = Size.UNKNOWN
+        newlyRenderedFirstFrame = false
         runCatching { engine.setMedia(uri, externalSubtitles, mediaPositionMs) }
             .onFailure { error ->
                 phase = VlcPlaybackPhase.ERROR
                 playerError = PlaybackException(
-                    "Unable to open media with LibVLC",
+                    "Unable to open media with MPV",
                     error,
                     PlaybackException.ERROR_CODE_IO_UNSPECIFIED,
                 )
@@ -409,6 +416,14 @@ class VlcPlayer(
 
     private fun handleEngineEvent(event: VlcEngineEvent) {
         if (closed.get()) return
+        // stop/clear/loadfile are asynchronous in libmpv. Ignore callbacks belonging to the
+        // item that was just cleared; SimpleBasePlayer forbids READY/BUFFERING with no playlist.
+        if (
+            mediaItem == null &&
+            event.kind != VlcEngineEvent.Kind.SURFACE_SIZE_CHANGED
+        ) {
+            return
+        }
         event.positionMs?.let {
             mediaPositionMs = it.coerceAtLeast(0L)
             positionAnchorMs = nowMs()
@@ -422,10 +437,16 @@ class VlcPlayer(
         }
         event.videoSize?.let {
             if (it.width > 0 && it.height > 0) {
-                // LibVLC applies stream rotation before rendering; Media3 only needs the displayed
+                // MPV applies stream rotation before rendering; Media3 only needs the displayed
                 // dimensions and pixel ratio. Avoid the deprecated unapplied-rotation constructor.
                 videoSize = VideoSize(it.width, it.height, it.pixelWidthHeightRatio)
             }
+        }
+        event.surfaceSize?.let {
+            surfaceSize = if (it.width > 0 && it.height > 0) Size(it.width, it.height) else Size.UNKNOWN
+        }
+        if (event.firstFrameRendered && trackSnapshot.tracks.any { it.type == VlcTrackType.VIDEO }) {
+            newlyRenderedFirstFrame = true
         }
         when (event.kind) {
             VlcEngineEvent.Kind.MEDIA_CHANGED -> {
@@ -473,7 +494,7 @@ class VlcPlayer(
                 isLoading = false
                 playWhenReady = false
                 playerError = PlaybackException(
-                    "LibVLC playback failed",
+                    "MPV playback failed",
                     event.error,
                     PlaybackException.ERROR_CODE_DECODER_INIT_FAILED,
                 )
@@ -483,10 +504,11 @@ class VlcPlayer(
             VlcEngineEvent.Kind.LENGTH_CHANGED,
             VlcEngineEvent.Kind.SEEKABLE_CHANGED,
             VlcEngineEvent.Kind.VOUT,
+            VlcEngineEvent.Kind.SURFACE_SIZE_CHANGED,
             -> Unit
             VlcEngineEvent.Kind.TRACKS_CHANGED -> {
-                // LibVLC has no distinct prepared callback. A successful parse with published
-                // streams is the paused/ready state expected by MediaSession and PlayerView.
+                // MPV has no Media3 prepared callback. A successful track list is the
+                // paused/ready state expected by MediaSession and PlayerView.
                 if (!playWhenReady && trackSnapshot.tracks.isNotEmpty() &&
                     phase in setOf(VlcPlaybackPhase.OPENING, VlcPlaybackPhase.BUFFERING)
                 ) {
@@ -527,6 +549,8 @@ class VlcPlayer(
         tracks = Tracks.EMPTY
         trackSnapshot = VlcTrackSnapshot()
         videoSize = VideoSize.UNKNOWN
+        surfaceSize = Size.UNKNOWN
+        newlyRenderedFirstFrame = false
         invalidateState()
     }
 
@@ -541,8 +565,8 @@ class VlcPlayer(
     }
 
     private fun applyTrackSelectionParameters() {
-        // LibVLC rejects stream selectors before a media item has been installed (and some builds
-        // reject them until elementary streams are parsed). Keep the Media3 parameters now and
+        // MPV rejects stream selectors before a media item has been installed. Keep the Media3
+        // parameters now and
         // apply them again from the first TRACKS_CHANGED event.
         if (mediaItem == null || trackSnapshot.tracks.isEmpty()) return
         selectedEngineTrackId(trackSelectionParameters, C.TRACK_TYPE_AUDIO)?.let(engine::selectAudioTrack)

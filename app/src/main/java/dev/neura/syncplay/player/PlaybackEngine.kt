@@ -10,18 +10,21 @@ import java.util.Locale
 enum class PlaybackEnginePreference {
     AUTOMATIC,
     MEDIA3,
-    VLC,
+    MPV,
 }
 
 /** Concrete player currently attached to the Media3 session. */
 enum class PlaybackEngine {
     MEDIA3,
-    VLC,
+    MPV,
 }
 
 enum class PlaybackEngineReason {
     DEFAULT,
     MATROSKA_COMPATIBILITY,
+    DIRECT_SMB_COMPATIBILITY,
+    SEQUENTIAL_PROVIDER_COMPATIBILITY,
+    UNVERIFIED_PROVIDER_COMPATIBILITY,
     USER_SELECTION,
 }
 
@@ -35,20 +38,42 @@ data class PlaybackEngineState(
  * Selects the concrete decoder before a media item is installed.
  *
  * Media3 remains the session/controller contract in every mode. Matroska is routed to the
- * LibVLC-backed Media3 Player in automatic mode because vendor HEVC Main10 decoders and remote
- * content providers are the combination most often associated with stalled seek/playback.
+ * libmpv-backed Media3 Player in automatic mode because vendor HEVC Main10 decoders are commonly
+ * associated with stalled seek/playback. The app's direct SMB URI stays on Media3 because the
+ * bundled libmpv intentionally has no native SMB/credential bridge; SMB document providers still
+ * use MPV through their seekable Android file descriptor.
  */
 internal fun selectPlaybackEngine(
     preference: PlaybackEnginePreference,
     displayName: String?,
     mimeType: String?,
     uriPath: String?,
+    sourceAccess: SourceAccessClassification = SourceAccessClassification.UNKNOWN,
 ): Pair<PlaybackEngine, PlaybackEngineReason> = when (preference) {
     PlaybackEnginePreference.MEDIA3 -> PlaybackEngine.MEDIA3 to PlaybackEngineReason.USER_SELECTION
-    PlaybackEnginePreference.VLC -> PlaybackEngine.VLC to PlaybackEngineReason.USER_SELECTION
+    PlaybackEnginePreference.MPV -> {
+        if (sourceAccess == SourceAccessClassification.SEQUENTIAL) {
+            PlaybackEngine.MEDIA3 to PlaybackEngineReason.SEQUENTIAL_PROVIDER_COMPATIBILITY
+        } else if (uriPath?.startsWith("syncplaysmb:", ignoreCase = true) == true) {
+            PlaybackEngine.MEDIA3 to PlaybackEngineReason.DIRECT_SMB_COMPATIBILITY
+        } else {
+            PlaybackEngine.MPV to PlaybackEngineReason.USER_SELECTION
+        }
+    }
     PlaybackEnginePreference.AUTOMATIC -> {
-        if (isMatroskaMedia(displayName, mimeType, uriPath)) {
-            PlaybackEngine.VLC to PlaybackEngineReason.MATROSKA_COMPATIBILITY
+        if (sourceAccess == SourceAccessClassification.SEQUENTIAL) {
+            PlaybackEngine.MEDIA3 to PlaybackEngineReason.SEQUENTIAL_PROVIDER_COMPATIBILITY
+        } else if (uriPath?.startsWith("syncplaysmb:", ignoreCase = true) == true) {
+            PlaybackEngine.MEDIA3 to PlaybackEngineReason.DIRECT_SMB_COMPATIBILITY
+        } else if (
+            uriPath?.startsWith("content:", ignoreCase = true) == true &&
+            sourceAccess != SourceAccessClassification.SEEKABLE
+        ) {
+            // UNKNOWN is deliberately not proof of random access. Users can still explicitly
+            // request MPV, but automatic mode leaves an inconclusive provider on Media3.
+            PlaybackEngine.MEDIA3 to PlaybackEngineReason.UNVERIFIED_PROVIDER_COMPATIBILITY
+        } else if (isMatroskaMedia(displayName, mimeType, uriPath)) {
+            PlaybackEngine.MPV to PlaybackEngineReason.MATROSKA_COMPATIBILITY
         } else {
             PlaybackEngine.MEDIA3 to PlaybackEngineReason.DEFAULT
         }

@@ -2,28 +2,41 @@ package dev.neura.syncplay.player.vlc
 
 import android.content.ContentResolver
 import android.content.Context
+import android.content.res.AssetFileDescriptor
+import android.graphics.SurfaceTexture
 import android.net.Uri
+import android.os.Build
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.TextureView
-import androidx.annotation.MainThread
-import org.videolan.libvlc.LibVLC
-import org.videolan.libvlc.Media
-import org.videolan.libvlc.MediaPlayer
-import org.videolan.libvlc.interfaces.IMedia
-import org.videolan.libvlc.interfaces.IVLCVout
-import java.io.Closeable
-import java.io.IOException
-import java.util.Locale
-import dev.neura.syncplay.smb.SmbConnectionProfile
-import dev.neura.syncplay.smb.SmbConnectionProfileRegistry
+import androidx.core.content.ContextCompat
+import androidx.media3.common.C
+import androidx.media3.common.Format
+import androidx.media3.datasource.DataSourceInputStream
+import androidx.media3.datasource.DataSpec
 import dev.neura.syncplay.smb.SmbPlaybackEnvironment
-import dev.neura.syncplay.smb.SmbLocation
 import dev.neura.syncplay.smb.SmbUri
+import `is`.xyz.mpv.MPV
+import `is`.xyz.mpv.MPVNode
+import java.io.Closeable
+import java.io.File
+import java.io.IOException
+import java.io.InputStream
+import java.io.InterruptedIOException
+import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /** External subtitle information passed from Media3's MediaItem. */
 data class VlcExternalSubtitle(
@@ -35,7 +48,7 @@ data class VlcExternalSubtitle(
     val selectionFlags: Int = 0,
 )
 
-/** The narrow engine surface consumed by [VlcPlayer]. */
+/** The narrow native-engine surface consumed by [VlcPlayer]. */
 interface VlcPlayerEngine : Closeable {
     fun setListener(listener: ((VlcEngineEvent) -> Unit)?)
     fun setMedia(
@@ -47,7 +60,6 @@ interface VlcPlayerEngine : Closeable {
     fun play()
     fun pause()
     fun stop()
-    /** Drop the current source and any provider descriptor while retaining the engine instance. */
     fun clearMedia() = Unit
     fun seekTo(positionMs: Long)
     fun setRate(rate: Float)
@@ -56,7 +68,6 @@ interface VlcPlayerEngine : Closeable {
     fun getVolume(): Float
     fun setVideoOutput(output: Any?)
     fun clearVideoOutput(output: Any?)
-    /** Optional stream selectors; lightweight test engines may leave these as no-ops. */
     fun selectAudioTrack(id: Int) = Unit
     fun selectVideoTrack(id: Int) = Unit
     fun selectSubtitleTrack(id: Int)
@@ -68,76 +79,120 @@ interface VlcPlayerEngine : Closeable {
 }
 
 /**
- * LibVLC 3.7.5 implementation. This class only uses the public LGPL Java binding; no VLC source
- * or GPL application code is bundled in Syncplay Droid.
+ * libmpv implementation used for demanding Matroska/HEVC playback.
  *
- * LibVLC has no separate prepare call. [prepare] parses the media asynchronously; actual decode
- * starts when [play] is called. This preserves Media3's prepare/play contract for controllers.
+ * AndroidX Media3 remains the public Player and MediaSession contract. libmpv owns demuxing,
+ * MediaCodec/software decoding, GPU presentation and libass subtitle rendering. Every blocking
+ * native command runs on [commandThread], while events return to the Media3 player's looper.
  */
-@MainThread
-class LibVlcEngine(
+class LibMpvEngine(
     context: Context,
-    options: List<String> = DEFAULT_OPTIONS,
     private val eventHandler: Handler = Handler(Looper.getMainLooper()),
-    /** Process-local SMB credential registry. No password is read unless a syncplaysmb URI is used. */
-    private val smbProfiles: SmbConnectionProfileRegistry = SmbPlaybackEnvironment.registry,
     private val onInitializationStage: (String) -> Unit = {},
-) : VlcPlayerEngine {
+) : VlcPlayerEngine, MPV.EventObserver {
     private val appContext = context.applicationContext
-    private val libVlc = run {
-        onInitializationStage("LibVLC")
-        // LibVLC appends its device-specific audio/video defaults to the supplied list. Kotlin's
-        // listOf is read-only and would make its Java constructor throw UnsupportedOperationException.
-        LibVLC(appContext, options.toMutableList())
+    private val commandThread = HandlerThread("Syncplay-libmpv").apply { start() }
+    private val commandHandler = Handler(commandThread.looper)
+    private val subtitleExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "Syncplay-subtitle-io").apply { isDaemon = true }
     }
-    private val mediaPlayer = run {
-        onInitializationStage("MediaPlayer")
-        MediaPlayer(libVlc)
-    }
-    private var currentMedia: IMedia? = null
-    private var externalSubtitles: List<VlcExternalSubtitle> = emptyList()
-    private var listener: ((VlcEngineEvent) -> Unit)? = null
-    private var snapshot = VlcTrackSnapshot()
-    private var positionMs = 0L
-    /** Initial or user-requested position retried once the native input becomes seekable. */
-    private var pendingSeekPositionMs: Long? = null
-    private var durationMs = Long.MIN_VALUE
-    private var seekable = false
-    private var parseRequested = false
-    private var released = false
+    private val mediaGeneration = AtomicLong(0L)
+    private val subtitleLoad = AtomicReference<SubtitleLoadJob?>()
+
+    @Volatile private var listener: ((VlcEngineEvent) -> Unit)? = null
+    @Volatile private var initializationError: Throwable? = null
+    @Volatile private var snapshot = VlcTrackSnapshot()
+    @Volatile private var positionMs = 0L
+    @Volatile private var durationMs = C.TIME_UNSET
+    @Volatile private var seekable = false
+    @Volatile private var rate = 1f
+    @Volatile private var volume = 1f
+    @Volatile private var released = false
+
+    /** Owned and touched only by [commandThread]. */
+    private var mpv: MPV? = null
+    private var pendingSource: OpenedMpvSource? = null
+    private var pendingSourceGeneration = 0L
+    private var activeSource: OpenedMpvSource? = null
+    private var activeSourceGeneration = 0L
+    private var pendingSubtitles: List<OpenedMpvSubtitle> = emptyList()
+    private var activeSubtitles: List<OpenedMpvSubtitle> = emptyList()
+    private var configuredSubtitles: List<VlcExternalSubtitle> = emptyList()
+    private var activeLease: MpvSourceLease? = null
+    /** Load commands and END_FILE events are correlated by mpv's lifetime-unique playlist id. */
+    private val awaitingStartLeases = java.util.ArrayDeque<MpvSourceLease>()
+    private val leasesByEntryId = mutableMapOf<Long, MpvSourceLease>()
+    private var activeEntryId: Long? = null
+    private var nativeLease: MpvSourceLease? = null
+    private var nativeEntryId: Long? = null
+    private var pendingStartPositionMs = 0L
+    private var fileLoaded = false
+    private var attachedSurface: Surface? = null
+
+    /** View ownership and callbacks stay on Android's main thread. */
     private var output: Any? = null
-    /** A provider-owned descriptor must stay open for the lifetime of the LibVLC media object. */
-    private var sourceDescriptor: Closeable? = null
-    /** Descriptors backing `fd://` side-loaded subtitles; closed with the current media item. */
-    private val subtitleDescriptors = mutableListOf<ParcelFileDescriptor>()
-    private var mediaGeneration = 0L
-    private val layoutListener = object : IVLCVout.OnNewVideoLayoutListener {
-        override fun onNewVideoLayout(
-            vout: IVLCVout,
-            width: Int,
-            height: Int,
-            visibleWidth: Int,
-            visibleHeight: Int,
-            sarNum: Int,
-            sarDen: Int,
-        ) {
-            if (width <= 0 || height <= 0) return
-            val ratio = if (sarNum > 0 && sarDen > 0) sarNum.toFloat() / sarDen else 1f
-            emit(
-                VlcEngineEvent(
-                    kind = VlcEngineEvent.Kind.VOUT,
-                    videoSize = VlcVideoSize(width, height, ratio),
-                ),
-            )
+    private var ownedSurfaceTexture: SurfaceTexture? = null
+    private var ownedTextureSurface: Surface? = null
+
+    private fun owns(holder: SurfaceHolder): Boolean = when (val current = output) {
+        is SurfaceView -> current.holder === holder
+        is SurfaceHolder -> current === holder
+        else -> false
+    }
+
+    private val surfaceCallback = object : SurfaceHolder.Callback {
+        override fun surfaceCreated(holder: SurfaceHolder) {
+            if (!owns(holder)) return
+            val (width, height) = (output as? SurfaceView)?.let { it.width to it.height }
+                ?: (holder.surfaceFrame.width() to holder.surfaceFrame.height())
+            attachSurfaceAsync(holder.surface, width, height)
+        }
+
+        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+            if (owns(holder)) attachSurfaceAsync(holder.surface, width, height)
+        }
+
+        override fun surfaceDestroyed(holder: SurfaceHolder) {
+            if (owns(holder)) detachSurfaceAsync(expectedSurface = holder.surface)
         }
     }
 
+    private val textureListener = object : TextureView.SurfaceTextureListener {
+        override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+            if ((output as? TextureView)?.surfaceTexture !== surface) return
+            val owned = Surface(surface)
+            ownedSurfaceTexture = surface
+            ownedTextureSurface = owned
+            attachSurfaceAsync(owned, width, height)
+        }
+
+        override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
+            if (ownedSurfaceTexture !== surface) return
+            val owned = ownedTextureSurface ?: return
+            attachSurfaceAsync(owned, width, height)
+        }
+
+        override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+            if (ownedSurfaceTexture !== surface) return true
+            val owned = ownedTextureSurface
+            ownedSurfaceTexture = null
+            ownedTextureSurface = null
+            detachSurfaceAsync(expectedSurface = owned, releaseAfterDetach = owned)
+            return true
+        }
+
+        override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+    }
+
     init {
-        onInitializationStage("event listener")
+        commandHandler.post(::initializeNativePlayer)
     }
 
     override fun setListener(listener: ((VlcEngineEvent) -> Unit)?) {
         this.listener = listener
+        initializationError?.let { error ->
+            if (listener != null) emitPlaybackError(error)
+        }
     }
 
     override fun setMedia(
@@ -145,726 +200,1080 @@ class LibVlcEngine(
         externalSubtitles: List<VlcExternalSubtitle>,
         startPositionMs: Long,
     ) {
-        check(!released) { "LibVlcEngine is released" }
-        stopAndReleaseMedia()
-        this.externalSubtitles = externalSubtitles
-        snapshot = VlcTrackSnapshot()
-        positionMs = 0L
-        pendingSeekPositionMs = startPositionMs.takeIf { it > 0L }
-        durationMs = Long.MIN_VALUE
+        val generation = mediaGeneration.incrementAndGet()
+        cancelSubtitleLoad()
+        positionMs = startPositionMs.coerceAtLeast(0L)
+        durationMs = C.TIME_UNSET
         seekable = false
-        parseRequested = false
-
-        val smbProfile = uri.takeIf(SmbUri::isSmbUri)?.let { smbProfiles.require(SmbUri.parse(it).profileId) }
-        val opened = openMedia(uri, smbProfile)
-        val media = opened.media
-        try {
-            // setDefaultMediaPlayerOptions adds the Android-safe baseline options in LibVLC 3.x.
-            media.setDefaultMediaPlayerOptions()
-            startPositionMs.takeIf { it > 0L }?.let { position ->
-                // Give the native input an early start hint. pendingSeekPositionMs also retries
-                // after Seekable/Playing because some provider and Matroska inputs ignore the
-                // option until playback has actually opened.
-                media.addOption(
-                    ":start-time=" + String.format(Locale.ROOT, "%.3f", position / 1_000.0),
-                )
-                positionMs = position
-            }
-            smbProfile?.applyCredentials(media)
-            val generation = ++mediaGeneration
-            installMediaPlayerListener(generation)
-            mediaPlayer.setMedia(media)
-            // MediaPlayer retains the media after setMedia. Keep the constructor's reference in
-            // currentMedia until the next replacement, then release it independently of the
-            // MediaPlayer-owned reference.
-            currentMedia = media
-            sourceDescriptor = opened.descriptor
-            media.setEventListener(IMedia.EventListener { event ->
-                if (event.type == IMedia.Event.ParsedChanged || event.type == IMedia.Event.DurationChanged) {
-                    eventHandler.post {
-                        // LibVLC can deliver a late parse event after a new item was installed.
-                        // Ignore it rather than publishing stale tracks/duration to Media3.
-                        if (released || currentMedia !== media || mediaGeneration != generation) return@post
-                        // A metadata parse may time out on a large remote Matroska even while the
-                        // playback input is valid and already decoding. Publish whatever streams
-                        // LibVLC knows; only MediaPlayer.EncounteredError is a playback failure.
-                        refreshTracks()
-                        emit(
-                            VlcEngineEvent(
-                                kind = VlcEngineEvent.Kind.TRACKS_CHANGED,
-                                durationMs = media.getDuration().takeIf { it >= 0L },
-                                tracks = snapshot,
-                            ),
-                        )
-                    }
-                }
-            })
-        } catch (error: Throwable) {
-            mediaGeneration++
-            runCatching { mediaPlayer.setEventListener(null) }
-            runCatching { media.setEventListener(null) }
-            runCatching { media.release() }
-            // setMedia retains its argument before returning. If configuration fails after that
-            // call, clear the player immediately so the native reference cannot linger until the
-            // next item or engine release.
-            runCatching { mediaPlayer.setMedia(null) }
-            runCatching { opened.descriptor?.close() }
-            if (sourceDescriptor === opened.descriptor) sourceDescriptor = null
-            currentMedia = null
-            throw error
-        }
-
-        // Side-loaded subtitles are LibVLC slaves. They are attached before prepare/play so they
-        // appear alongside embedded streams when ESAdded is emitted.
-        externalSubtitles.forEach { subtitle ->
-            var openedSubtitle: OpenedSubtitle? = null
-            runCatching {
-                val subtitleProfile = subtitle.uri.takeIf(SmbUri::isSmbUri)
-                    ?.let { smbProfiles.require(SmbUri.parse(it).profileId) }
-                val opened = openSubtitle(subtitle.uri, subtitleProfile)
-                openedSubtitle = opened
-                // LibVLC's SMB access module reads authentication from media options rather than
-                // URI user-info. A media descriptor has one global option set, so only apply the
-                // subtitle profile when it is the same profile as the main source (or when the
-                // main source is not SMB); otherwise a second profile would overwrite the main
-                // stream's credentials. Cross-profile slaves remain URI-safe but may require a
-                // separate playback item/provider in a future adapter revision.
-                if (subtitleProfile != null &&
-                    (smbProfile == null || subtitleProfile.id == smbProfile.id)
-                ) {
-                    subtitleProfile.applyCredentials(media)
-                }
-                media.addSlave(
-                    IMedia.Slave(
-                        IMedia.Slave.Type.Subtitle,
-                        /* user supplied slave priority */ 4,
-                        opened.vlcUri.toString(),
-                    ),
-                )
-                opened.descriptor?.let(subtitleDescriptors::add)
-                openedSubtitle = null
-            }.onFailure {
-                // A missing subtitle grant must not tear down otherwise valid video playback.
-                runCatching { openedSubtitle?.descriptor?.close() }
+        snapshot = VlcTrackSnapshot()
+        dispatch("open source") { core ->
+            if (generation != mediaGeneration.get()) return@dispatch
+            unloadCurrentMedia(core)
+            try {
+                configuredSubtitles = externalSubtitles
+                pendingSource = openSource(uri)
+                pendingSourceGeneration = generation
+                pendingSubtitles = emptyList()
+                pendingStartPositionMs = startPositionMs.coerceAtLeast(0L)
+                fileLoaded = false
+                emit(VlcEngineEvent(VlcEngineEvent.Kind.MEDIA_CHANGED, positionMs = positionMs))
+                scheduleSubtitleLoad(generation, externalSubtitles)
+            } catch (error: Throwable) {
+                emitPlaybackError(error)
             }
         }
-        emit(VlcEngineEvent(VlcEngineEvent.Kind.MEDIA_CHANGED))
     }
 
     override fun prepare() {
-        val media = currentMedia ?: return
-        if (media.isReleased) return
-        if (!parseRequested && !media.isParsed) {
-            val accepted = runCatching {
-                // ParseNetwork handles both content:// providers and HTTP/SMB streams. The call is
-                // asynchronous and does not start playback.
-                media.parseAsync(IMedia.Parse.ParseNetwork)
-            }.getOrDefault(false)
-            // parseAsync is advisory: some content providers reject pre-parsing but their native
-            // playback input still opens successfully. Do not show a false fatal error here.
-            parseRequested = accepted
+        dispatch("prepare") { core ->
+            val source = pendingSource ?: activeSource ?: return@dispatch
+            if (source === activeSource && activeLease?.ended == false) return@dispatch
+            emit(VlcEngineEvent(VlcEngineEvent.Kind.OPENING, positionMs = positionMs))
+            core.setPropertyBoolean("pause", true)
+            if (source === pendingSource) {
+                activeSource = source
+                activeSourceGeneration = pendingSourceGeneration
+                pendingSource = null
+                pendingSourceGeneration = 0L
+                activeSubtitles = pendingSubtitles
+                pendingSubtitles = emptyList()
+            }
+            val lease = activeLease?.takeIf { it.source === source } ?: MpvSourceLease(
+                source = source,
+                subtitles = activeSubtitles,
+            ).also { activeLease = it }
+            lease.ended = false
+            val loadResult = core.commandNode("loadfile", source.location, "replace")
+            val entryId = loadResult?.get("playlist_entry_id")?.asInt()
+                ?: core.getPropertyLong("playlist/0/id")
+            activeEntryId = entryId
+            if (entryId != null) {
+                leasesByEntryId[entryId] = lease
+            } else {
+                // Older mpv builds did not return the playlist id from loadfile. START_FILE is
+                // still ordered and can bind the lease in the normal single-load case.
+                awaitingStartLeases.addLast(lease)
+            }
         }
-        refreshTracks()
-        emit(VlcEngineEvent(VlcEngineEvent.Kind.OPENING, tracks = snapshot))
     }
 
     override fun play() {
-        if (released || currentMedia == null) return
-        runCatching { mediaPlayer.play() }
-            .onFailure { emit(VlcEngineEvent(VlcEngineEvent.Kind.ENCOUNTERED_ERROR, error = it)) }
+        dispatch("play") { it.setPropertyBoolean("pause", false) }
     }
 
     override fun pause() {
-        if (released) return
-        runCatching { mediaPlayer.pause() }
-            .onFailure { emit(VlcEngineEvent(VlcEngineEvent.Kind.ENCOUNTERED_ERROR, error = it)) }
+        dispatch("pause") { it.setPropertyBoolean("pause", true) }
     }
 
     override fun stop() {
-        if (released) return
-        runCatching { mediaPlayer.stop() }
-            .onFailure { emit(VlcEngineEvent(VlcEngineEvent.Kind.ENCOUNTERED_ERROR, error = it)) }
+        dispatch("stop") { core ->
+            core.command("stop")
+            fileLoaded = false
+            emit(VlcEngineEvent(VlcEngineEvent.Kind.STOPPED, positionMs = positionMs))
+        }
     }
 
     override fun clearMedia() {
-        if (released) return
-        stopAndReleaseMedia()
-        externalSubtitles = emptyList()
-        snapshot = VlcTrackSnapshot()
-        positionMs = 0L
-        durationMs = Long.MIN_VALUE
-        seekable = false
-        parseRequested = false
+        mediaGeneration.incrementAndGet()
+        cancelSubtitleLoad()
+        dispatch("clear media") { unloadCurrentMedia(it) }
     }
 
     override fun seekTo(positionMs: Long) {
-        if (released || currentMedia == null) return
-        this.positionMs = positionMs.coerceAtLeast(0L)
-        pendingSeekPositionMs = this.positionMs
-        applyPendingSeek(force = false)
+        val target = positionMs.coerceAtLeast(0L)
+        this.positionMs = target
+        dispatch("seek") { core ->
+            if (fileLoaded) {
+                core.command("seek", seconds(target).toString(), "absolute+exact")
+            } else {
+                pendingStartPositionMs = target
+            }
+            emit(VlcEngineEvent(VlcEngineEvent.Kind.POSITION_CHANGED, positionMs = target))
+        }
     }
 
     override fun setRate(rate: Float) {
-        if (released) return
-        val safeRate = rate.takeIf { it.isFinite() }?.coerceIn(0.25f, 4f) ?: 1f
-        runCatching { mediaPlayer.setRate(safeRate) }
-            .onFailure { emit(VlcEngineEvent(VlcEngineEvent.Kind.ENCOUNTERED_ERROR, error = it)) }
+        if (!rate.isFinite()) return
+        this.rate = rate.coerceIn(0.25f, 4f)
+        dispatch("speed") { it.setPropertyDouble("speed", this.rate.toDouble()) }
     }
 
-    override fun getRate(): Float = runCatching { mediaPlayer.getRate() }.getOrDefault(1f)
+    override fun getRate(): Float = rate
 
     override fun setVolume(volume: Float) {
-        if (released) return
-        val percent = (volume.coerceIn(0f, 1f) * 100f).toInt()
-        runCatching { mediaPlayer.setVolume(percent) }
-            .onFailure { emit(VlcEngineEvent(VlcEngineEvent.Kind.ENCOUNTERED_ERROR, error = it)) }
+        this.volume = volume.coerceIn(0f, 1f)
+        dispatch("volume") { it.setPropertyDouble("volume", this.volume * 100.0) }
     }
 
-    override fun getVolume(): Float = runCatching {
-        (mediaPlayer.getVolume() / 100f).coerceIn(0f, 1f)
-    }.getOrDefault(1f)
+    override fun getVolume(): Float = volume
 
     override fun setVideoOutput(output: Any?) {
-        if (released) return
-        clearVideoOutput(this.output)
+        if (released || this.output === output) return
+        removeOutputCallbacks()
+        detachSurfaceAsync()
         this.output = output
-        val vout = mediaPlayer.getVLCVout()
-        runCatching {
-            when (output) {
-                is SurfaceHolder -> vout.setVideoSurface(output.surface, output)
-                is Surface -> vout.setVideoSurface(output, null)
-                is SurfaceView -> vout.setVideoView(output)
-                is TextureView -> vout.setVideoView(output)
-                null -> return@runCatching
-                else -> return@runCatching
+        when (output) {
+            is SurfaceView -> {
+                output.holder.addCallback(surfaceCallback)
+                output.holder.surface.takeIf(Surface::isValid)?.let { surface ->
+                    attachSurfaceAsync(surface, output.width, output.height)
+                }
             }
-            vout.attachViews(layoutListener)
-        }.onFailure { emit(VlcEngineEvent(VlcEngineEvent.Kind.ENCOUNTERED_ERROR, error = it)) }
+            is SurfaceHolder -> {
+                output.addCallback(surfaceCallback)
+                output.surface.takeIf(Surface::isValid)?.let { surface ->
+                    val frame = output.surfaceFrame
+                    attachSurfaceAsync(surface, frame.width(), frame.height())
+                }
+            }
+            is TextureView -> {
+                output.surfaceTextureListener = textureListener
+                output.surfaceTexture?.takeIf { output.isAvailable }?.let { texture ->
+                    Surface(texture).also { surface ->
+                        ownedSurfaceTexture = texture
+                        ownedTextureSurface = surface
+                        attachSurfaceAsync(surface, output.width, output.height)
+                    }
+                }
+            }
+            is Surface -> if (output.isValid) attachSurfaceAsync(output, 0, 0)
+        }
     }
 
     override fun clearVideoOutput(output: Any?) {
-        if (released) return
         if (output != null && this.output !== output) return
-        runCatching { mediaPlayer.getVLCVout().detachViews() }
+        removeOutputCallbacks()
+        detachSurfaceAsync()
         this.output = null
     }
 
-    override fun selectAudioTrack(id: Int) {
-        if (released || id < -1) return
-        if (snapshot.selectedAudioId == id) return
-        val selected = runCatching { mediaPlayer.setAudioTrack(id) }
-            .onFailure { emit(VlcEngineEvent(VlcEngineEvent.Kind.ENCOUNTERED_ERROR, error = it)) }
-            .getOrDefault(false)
-        if (!selected) return
-        refreshTracks()
-        emit(VlcEngineEvent(VlcEngineEvent.Kind.TRACKS_CHANGED, tracks = snapshot))
-    }
+    override fun selectAudioTrack(id: Int) = selectTrack("aid", id)
 
-    override fun selectVideoTrack(id: Int) {
-        if (released) return
-        if (id >= 0 && snapshot.selectedVideoId == id) return
-        if (id < 0 && snapshot.selectedVideoId < 0) return
-        val selected = runCatching {
-            if (id < 0) {
-                mediaPlayer.setVideoTrackEnabled(false)
-                true
-            } else {
-                mediaPlayer.setVideoTrackEnabled(true)
-                mediaPlayer.setVideoTrack(id)
-            }
-        }.onFailure { emit(VlcEngineEvent(VlcEngineEvent.Kind.ENCOUNTERED_ERROR, error = it)) }
-            .getOrDefault(false)
-        if (!selected) return
-        refreshTracks()
-        emit(VlcEngineEvent(VlcEngineEvent.Kind.TRACKS_CHANGED, tracks = snapshot))
-    }
+    override fun selectVideoTrack(id: Int) = selectTrack("vid", id)
 
-    override fun selectSubtitleTrack(id: Int) {
-        if (released) return
-        if (snapshot.selectedTextId == id) return
-        val selected = runCatching { mediaPlayer.setSpuTrack(id) }
-            .onFailure { emit(VlcEngineEvent(VlcEngineEvent.Kind.ENCOUNTERED_ERROR, error = it)) }
-            .getOrDefault(false)
-        if (!selected) return
-        refreshTracks()
-        emit(VlcEngineEvent(VlcEngineEvent.Kind.TRACKS_CHANGED, tracks = snapshot))
-    }
+    override fun selectSubtitleTrack(id: Int) = selectTrack("sid", id)
 
     override fun currentSnapshot(): VlcTrackSnapshot = snapshot
-
     override fun currentPositionMs(): Long = positionMs
-
     override fun currentDurationMs(): Long = durationMs
-
     override fun isSeekable(): Boolean = seekable
 
     override fun close() {
         if (released) return
+        when (val current = output) {
+            is SurfaceView -> current.holder.removeCallback(surfaceCallback)
+            is SurfaceHolder -> current.removeCallback(surfaceCallback)
+            is TextureView -> if (current.surfaceTextureListener === textureListener) {
+                current.surfaceTextureListener = null
+            }
+        }
+        output = null
+        ownedSurfaceTexture = null
+        val textureSurface = ownedTextureSurface
+        ownedTextureSurface = null
         released = true
+        mediaGeneration.incrementAndGet()
+        cancelSubtitleLoad()
+        subtitleExecutor.shutdownNow()
         listener = null
-        runCatching { mediaPlayer.setEventListener(null) }
-        runCatching { mediaPlayer.getVLCVout().detachViews() }
-        runCatching { mediaPlayer.stop() }
-        stopAndReleaseMedia()
-        runCatching { mediaPlayer.release() }
-        runCatching { libVlc.release() }
+        commandHandler.post {
+            val core = mpv
+            if (core != null) {
+                runCatching { core.setPropertyString("vo", "null") }
+                runCatching { if (attachedSurface != null) core.detachSurface() }
+                attachedSurface = null
+                textureSurface?.release()
+                runCatching { core.removeObserver(this) }
+                runCatching { core.destroy() }
+                mpv = null
+            }
+            // mpv_destroy joins the native event thread. Descriptors are therefore closed only
+            // after every demux/decode reader has stopped using them.
+            closeSources()
+            commandThread.quitSafely()
+        }
     }
 
-    private fun handlePlayerEvent(event: MediaPlayer.Event) {
-        if (released) return
-        when (event.type) {
-            MediaPlayer.Event.MediaChanged -> emit(VlcEngineEvent(VlcEngineEvent.Kind.MEDIA_CHANGED))
-            MediaPlayer.Event.Opening -> emit(VlcEngineEvent(VlcEngineEvent.Kind.OPENING))
-            MediaPlayer.Event.Buffering -> {
-                val percent = event.getBuffering().coerceIn(0f, 100f)
-                val estimate = durationMs.takeIf { it >= 0L }?.let { (it * percent / 100f).toLong() }
-                emit(VlcEngineEvent(VlcEngineEvent.Kind.BUFFERING, bufferingPercent = percent, positionMs = positionMs))
-                if (estimate != null) durationMs = durationMs.coerceAtLeast(estimate)
+    override fun eventProperty(property: String) = Unit
+
+    override fun eventProperty(property: String, value: Long) {
+        postNativeEvent("property $property") {
+            if (isCurrentNativeLoad()) handleLongProperty(property, value)
+        }
+    }
+
+    override fun eventProperty(property: String, value: Boolean) {
+        postNativeEvent("property $property") {
+            if (isCurrentNativeLoad()) handleBooleanProperty(property, value)
+        }
+    }
+
+    override fun eventProperty(property: String, value: String) {
+        if (property == "sid" || property == "aid" || property == "vid") {
+            postNativeEvent("property $property") { if (isCurrentNativeLoad()) refreshTracks() }
+        }
+    }
+
+    override fun eventProperty(property: String, value: Double) {
+        postNativeEvent("property $property") {
+            if (isCurrentNativeLoad()) handleDoubleProperty(property, value)
+        }
+    }
+
+    override fun eventProperty(property: String, value: MPVNode) {
+        postNativeEvent("property $property") {
+            if (!isCurrentNativeLoad()) return@postNativeEvent
+            when (property) {
+                // A node callback can have been captured just before a concurrent sub-add.
+                // Query the current list on our serialized thread so a stale two-track snapshot
+                // cannot overwrite the newly attached external subtitle.
+                "track-list" -> refreshTracks()
+                "video-out-params", "video-params" -> publishVideoSize(value)
             }
-            MediaPlayer.Event.Playing -> {
-                applyPendingSeek(force = true)
-                emit(VlcEngineEvent(VlcEngineEvent.Kind.PLAYING))
+        }
+    }
+
+    override fun event(eventId: Int, data: MPVNode) {
+        postNativeEvent("event $eventId") { handleEvent(eventId, data) }
+    }
+
+    private fun initializeNativePlayer() {
+        try {
+            stage("native context")
+            val core = MPV()
+            core.create(appContext)
+            mpv = core
+            stage("decoder options")
+            DEFAULT_OPTIONS.forEach { (name, value) ->
+                check(core.setOptionString(name, value) >= 0) { "Unsupported mpv option: $name" }
             }
-            MediaPlayer.Event.Paused -> emit(VlcEngineEvent(VlcEngineEvent.Kind.PAUSED))
-            MediaPlayer.Event.Stopped -> emit(VlcEngineEvent(VlcEngineEvent.Kind.STOPPED))
-            MediaPlayer.Event.EndReached -> emit(VlcEngineEvent(VlcEngineEvent.Kind.END_REACHED))
-            MediaPlayer.Event.EncounteredError -> emit(
-                VlcEngineEvent(
-                    kind = VlcEngineEvent.Kind.ENCOUNTERED_ERROR,
-                    error = IllegalStateException("LibVLC playback error"),
-                ),
-            )
-            MediaPlayer.Event.TimeChanged -> {
-                positionMs = event.getTimeChanged().coerceAtLeast(0L)
-                pendingSeekPositionMs?.let { requested ->
-                    if (kotlin.math.abs(positionMs - requested) <= SEEK_CONFIRMATION_TOLERANCE_MS) {
-                        pendingSeekPositionMs = null
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                ContextCompat.getDisplayOrDefault(appContext).mode.refreshRate
+                    .takeIf { it.isFinite() && it > 0f }
+                    ?.let { refreshRate ->
+                        check(core.setOptionString("display-fps-override", refreshRate.toString()) >= 0)
                     }
+            }
+            val certificateBundle = ensureCertificateBundle()
+            check(core.setOptionString("tls-verify", "yes") >= 0)
+            check(core.setOptionString("tls-ca-file", certificateBundle.absolutePath) >= 0)
+            core.addObserver(this)
+            stage("native initialization")
+            core.init()
+            OBSERVED_PROPERTIES.forEach { (name, format) -> core.observeProperty(name, format) }
+            core.setPropertyString("vo", "null")
+            core.setPropertyString("force-window", "no")
+            stage("ready")
+        } catch (error: Throwable) {
+            initializationError = error
+            mpv?.let { core ->
+                runCatching { core.removeObserver(this) }
+                runCatching { if (core.isInitialized) core.destroy() }
+            }
+            mpv = null
+            emitPlaybackError(error)
+        }
+    }
+
+    private fun handleEvent(eventId: Int, data: MPVNode) {
+        when (eventId) {
+            MPV.mpvEvent.MPV_EVENT_START_FILE -> onStartFile(data)
+            MPV.mpvEvent.MPV_EVENT_FILE_LOADED -> if (isCurrentNativeLoad()) onFileLoaded()
+            MPV.mpvEvent.MPV_EVENT_VIDEO_RECONFIG -> {
+                if (isCurrentNativeLoad()) {
+                    refreshVideoSize()
+                    refreshTracks()
                 }
+            }
+            MPV.mpvEvent.MPV_EVENT_SEEK -> if (isCurrentNativeLoad()) {
+                emit(VlcEngineEvent(VlcEngineEvent.Kind.BUFFERING, positionMs = positionMs))
+            }
+            MPV.mpvEvent.MPV_EVENT_PLAYBACK_RESTART -> if (isCurrentNativeLoad()) {
+                publishPlaybackPhase(firstFrameRendered = true)
+            }
+            MPV.mpvEvent.MPV_EVENT_END_FILE -> onEndFile(data)
+        }
+    }
+
+    private fun onStartFile(data: MPVNode) {
+        val entryId = data["playlist_entry_id"]?.asInt()
+        val lease = if (entryId != null) {
+            leasesByEntryId[entryId]
+        } else {
+            awaitingStartLeases.pollFirst()
+        }
+        val resolvedEntryId = entryId ?: activeEntryId?.takeIf { lease === activeLease }
+        nativeLease = lease
+        nativeEntryId = resolvedEntryId
+        if (lease != null && resolvedEntryId != null) leasesByEntryId[resolvedEntryId] = lease
+        if (lease !== activeLease || (activeEntryId != null && resolvedEntryId != activeEntryId)) return
+        fileLoaded = false
+        emit(VlcEngineEvent(VlcEngineEvent.Kind.OPENING, positionMs = positionMs))
+    }
+
+    private fun onFileLoaded() {
+        val core = mpv ?: return
+        fileLoaded = true
+        addExternalSubtitles(core)
+        pendingStartPositionMs.takeIf { it > 0L }?.let { target ->
+            core.command("seek", seconds(target).toString(), "absolute+exact")
+        }
+        pendingStartPositionMs = 0L
+        durationMs = core.getPropertyDouble("duration")?.let(::secondsToMs) ?: durationMs
+        seekable = core.getPropertyBoolean("seekable") ?: false
+        positionMs = core.getPropertyDouble("time-pos")?.let(::secondsToMs) ?: positionMs
+        refreshTracks()
+        refreshVideoSize()
+        publishPlaybackPhase()
+    }
+
+    private fun onEndFile(data: MPVNode) {
+        val entryId = data["playlist_entry_id"]?.asInt()
+        // The bundled mpv exposes this lifetime-unique ID. If an older build omits it, retaining
+        // the lease until destroy is safer than closing or stopping an unrelated current load.
+        if (entryId == null) return
+        val endedLease = leasesByEntryId.remove(entryId)
+        if (nativeEntryId == entryId) {
+            nativeEntryId = null
+            nativeLease = null
+        }
+        if (endedLease !== activeLease) {
+            endedLease?.close()
+            return
+        }
+        endedLease?.ended = true
+        activeEntryId = null
+        fileLoaded = false
+        when (data["reason"]?.asString()) {
+            "eof" -> emit(VlcEngineEvent(VlcEngineEvent.Kind.END_REACHED, positionMs = positionMs))
+            "error" -> emitPlaybackError(IOException("libmpv could not decode this media"))
+            else -> emit(VlcEngineEvent(VlcEngineEvent.Kind.STOPPED, positionMs = positionMs))
+        }
+    }
+
+    private fun handleDoubleProperty(property: String, value: Double) {
+        if (!value.isFinite()) return
+        when (property) {
+            "time-pos" -> {
+                positionMs = secondsToMs(value)
                 emit(VlcEngineEvent(VlcEngineEvent.Kind.TIME_CHANGED, positionMs = positionMs))
             }
-            MediaPlayer.Event.PositionChanged -> {
-                val position = event.getPositionChanged().takeIf { it.isFinite() }?.coerceIn(0f, 1f)
-                val mapped = if (position != null && durationMs >= 0L) (durationMs * position).toLong() else positionMs
-                positionMs = mapped.coerceAtLeast(0L)
-                emit(VlcEngineEvent(VlcEngineEvent.Kind.POSITION_CHANGED, positionMs = positionMs))
-            }
-            MediaPlayer.Event.LengthChanged -> {
-                durationMs = event.getLengthChanged().takeIf { it >= 0L } ?: Long.MIN_VALUE
+            "duration" -> {
+                durationMs = secondsToMs(value)
                 emit(VlcEngineEvent(VlcEngineEvent.Kind.LENGTH_CHANGED, durationMs = durationMs))
             }
-            MediaPlayer.Event.SeekableChanged -> {
-                seekable = event.getSeekable()
-                if (seekable) applyPendingSeek(force = false)
-                emit(VlcEngineEvent(VlcEngineEvent.Kind.SEEKABLE_CHANGED, seekable = seekable))
+            "cache-buffering-state" -> if (value < 100.0) {
+                emit(VlcEngineEvent(VlcEngineEvent.Kind.BUFFERING, bufferingPercent = value.toFloat()))
             }
-            MediaPlayer.Event.Vout -> {
-                refreshTracks()
-                emit(VlcEngineEvent(VlcEngineEvent.Kind.VOUT, tracks = snapshot, videoSize = currentVideoSize()))
+        }
+    }
+
+    private fun handleLongProperty(property: String, value: Long) {
+        if (property == "cache-buffering-state" && value < 100L) {
+            emit(VlcEngineEvent(VlcEngineEvent.Kind.BUFFERING, bufferingPercent = value.toFloat()))
+        }
+    }
+
+    private fun handleBooleanProperty(property: String, value: Boolean) {
+        when (property) {
+            "pause" -> if (fileLoaded && mpv?.getPropertyBoolean("paused-for-cache") != true) {
+                emit(
+                    VlcEngineEvent(
+                        if (value) VlcEngineEvent.Kind.PAUSED else VlcEngineEvent.Kind.PLAYING,
+                        positionMs = positionMs,
+                    ),
+                )
             }
-            MediaPlayer.Event.ESAdded,
-            MediaPlayer.Event.ESDeleted,
-            MediaPlayer.Event.ESSelected,
-            -> {
-                refreshTracks()
-                emit(VlcEngineEvent(VlcEngineEvent.Kind.TRACKS_CHANGED, tracks = snapshot, videoSize = currentVideoSize()))
+            "paused-for-cache", "seeking" -> if (value) {
+                emit(VlcEngineEvent(VlcEngineEvent.Kind.BUFFERING, positionMs = positionMs))
+            } else if (fileLoaded) {
+                publishPlaybackPhase()
             }
+            "seekable" -> {
+                seekable = value
+                emit(VlcEngineEvent(VlcEngineEvent.Kind.SEEKABLE_CHANGED, seekable = value))
+            }
+            "eof-reached" -> if (value) {
+                emit(VlcEngineEvent(VlcEngineEvent.Kind.END_REACHED, positionMs = positionMs))
+            }
+        }
+    }
+
+    private fun publishPlaybackPhase(firstFrameRendered: Boolean = false) {
+        val core = mpv ?: return
+        val kind = when {
+            core.getPropertyBoolean("paused-for-cache") == true ||
+                core.getPropertyBoolean("seeking") == true -> VlcEngineEvent.Kind.BUFFERING
+            core.getPropertyBoolean("pause") == true -> VlcEngineEvent.Kind.PAUSED
+            else -> VlcEngineEvent.Kind.PLAYING
+        }
+        emit(
+            VlcEngineEvent(
+                kind = kind,
+                // PLAYBACK_RESTART is also emitted for the first paused frame after prepare/seek.
+                firstFrameRendered = firstFrameRendered,
+                positionMs = positionMs,
+                durationMs = durationMs,
+                seekable = seekable,
+            ),
+        )
+    }
+
+    private fun isCurrentNativeLoad(): Boolean =
+        nativeLease != null &&
+            nativeLease === activeLease &&
+            (activeEntryId == null || nativeEntryId == activeEntryId)
+
+    private fun addExternalSubtitles(
+        core: MPV,
+        subtitles: List<OpenedMpvSubtitle> = activeSubtitles,
+    ) {
+        subtitles.forEach { subtitle ->
+            val title = subtitle.metadata.id?.takeIf(String::isNotBlank)
+                ?: subtitle.metadata.label?.takeIf(String::isNotBlank)
+                ?: subtitle.metadata.uri.lastPathSegment.orEmpty()
+            core.command(
+                "sub-add",
+                subtitle.source.location,
+                "auto",
+                title,
+                subtitle.metadata.language.orEmpty(),
+            )
         }
     }
 
     private fun refreshTracks() {
-        if (released) return
-        val descriptions = runCatching { mediaPlayer.getSpuTracks() }.getOrNull().orEmpty()
-        val audioDescriptions = runCatching { mediaPlayer.getAudioTracks() }.getOrNull().orEmpty()
-        val videoDescriptions = runCatching { mediaPlayer.getVideoTracks() }.getOrNull().orEmpty()
-        val mediaTracks = buildList {
-            val media = currentMedia ?: return@buildList
-            repeat(media.getTrackCount()) { index -> add(runCatching { media.getTrack(index) }.getOrNull()) }
-        }.filterNotNull()
+        mpv?.getPropertyNode("track-list")?.let(::publishTrackList)
+    }
 
-        val usedExternalIndices = mutableSetOf<Int>()
-        val textTracks = descriptions.filter { it.id >= 0 }.map { description ->
-            val mediaTrack = mediaTracks.firstOrNull { it.id == description.id }
-            val matchingExternal = externalSubtitles.indices
-                .asSequence()
-                .filterNot(usedExternalIndices::contains)
-                .mapNotNull { index ->
-                    externalSubtitles[index]
-                        .takeIf { descriptionMatchesSubtitle(description.name, it) }
-                        ?.let { index to it }
-                }
-                .firstOrNull()
-            // content:// slaves are deliberately passed as fd:// so LibVLC can read them, but
-            // that strips the original filename from the native track description. Streams that
-            // do not belong to the parsed container are sidecars, so map those deterministically
-            // in attachment order when name matching is impossible.
-            val externalPair = matchingExternal ?: if (mediaTrack == null) {
-                externalSubtitles.indices
-                    .firstOrNull { it !in usedExternalIndices }
-                    ?.let { it to externalSubtitles[it] }
-            } else {
-                null
+    private fun publishTrackList(node: MPVNode) {
+        val core = mpv ?: return
+        val mapped = node.asArray().orEmpty().mapNotNull { entry ->
+            val map = entry.asMap() ?: return@mapNotNull null
+            val id = map.long("id")?.toInt() ?: return@mapNotNull null
+            val type = when (map.string("type")) {
+                "audio" -> VlcTrackType.AUDIO
+                "video" -> VlcTrackType.VIDEO
+                "sub" -> VlcTrackType.TEXT
+                else -> VlcTrackType.UNKNOWN
             }
-            val external = externalPair
-                ?.also { usedExternalIndices += it.first }
-                ?.second
+            if (type == VlcTrackType.UNKNOWN) return@mapNotNull null
+            val title = map.string("title")
+            val externalFilename = map.string("external-filename")
+            val externalId = configuredSubtitles.firstOrNull { subtitle ->
+                externalTrackMatches(subtitle, title, externalFilename)
+            }?.id
             VlcTrackInfo(
-                id = description.id,
-                type = VlcTrackType.TEXT,
-                // Sidecar streams may not appear in IMedia tracks. Preserve their declared MIME
-                // so the Media3 facade advertises ASS/SRT as supported rather than "unknown".
-                codec = mediaTrack?.codec ?: mediaTrack?.originalCodec ?: external?.mimeType,
-                language = mediaTrack?.language ?: external?.language,
-                description = description.name,
-                label = external?.label ?: description.name,
-                externalId = external?.id,
-                selectionFlags = external?.selectionFlags ?: 0,
-                roleFlags = if (external != null) 0 else androidx.media3.common.C.ROLE_FLAG_SUBTITLE,
-            )
-        }
-        val audioTracks = audioDescriptions.filter { it.id >= 0 }.map { description ->
-            val mediaTrack = mediaTracks.firstOrNull { it.id == description.id } as? IMedia.AudioTrack
-            VlcTrackInfo(
-                id = description.id,
-                type = VlcTrackType.AUDIO,
-                codec = mediaTrack?.codec ?: mediaTrack?.originalCodec,
-                bitrate = mediaTrack?.bitrate ?: -1,
-                language = mediaTrack?.language,
-                description = description.name,
-                label = description.name,
-                channelCount = mediaTrack?.channels ?: -1,
-                sampleRate = mediaTrack?.rate ?: -1,
-            )
-        }
-        val videoTracks = videoDescriptions.filter { it.id >= 0 }.map { description ->
-            val mediaTrack = mediaTracks.firstOrNull { it.id == description.id } as? IMedia.VideoTrack
-            VlcTrackInfo(
-                id = description.id,
-                type = VlcTrackType.VIDEO,
-                codec = mediaTrack?.codec ?: mediaTrack?.originalCodec,
-                bitrate = mediaTrack?.bitrate ?: -1,
-                language = mediaTrack?.language,
-                description = description.name,
-                label = description.name,
-                width = mediaTrack?.width ?: -1,
-                height = mediaTrack?.height ?: -1,
-                frameRate = if (mediaTrack != null && mediaTrack.frameRateDen > 0) {
-                    mediaTrack.frameRateNum.toFloat() / mediaTrack.frameRateDen
-                } else -1f,
-                pixelWidthHeightRatio = if (mediaTrack != null && mediaTrack.sarDen > 0) {
-                    mediaTrack.sarNum.toFloat() / mediaTrack.sarDen
-                } else 1f,
-                rotationDegrees = orientationToRotation(mediaTrack?.orientation ?: 0),
+                id = id,
+                type = type,
+                codec = map.string("codec"),
+                originalCodec = map.string("codec-desc"),
+                bitrate = map.long("demux-bitrate")?.coerceAtMost(Int.MAX_VALUE.toLong())?.toInt()
+                    ?: Format.NO_VALUE,
+                language = map.string("lang"),
+                description = map.string("codec-desc"),
+                label = title,
+                selectionFlags = (if (map.boolean("default") == true) C.SELECTION_FLAG_DEFAULT else 0) or
+                    (if (map.boolean("forced") == true) C.SELECTION_FLAG_FORCED else 0),
+                roleFlags = (if (map.boolean("hearing-impaired") == true) C.ROLE_FLAG_CAPTION else 0) or
+                    (if (map.boolean("visual-impaired") == true) C.ROLE_FLAG_DESCRIBES_VIDEO else 0) or
+                    (if (map.boolean("commentary") == true) C.ROLE_FLAG_COMMENTARY else 0),
+                externalId = externalId,
+                width = map.long("demux-w")?.toInt() ?: Format.NO_VALUE,
+                height = map.long("demux-h")?.toInt() ?: Format.NO_VALUE,
+                sampleRate = map.long("demux-samplerate")?.toInt() ?: Format.NO_VALUE,
+                channelCount = map.long("demux-channel-count")?.toInt()
+                    ?: parseChannelCount(map.string("audio-channels")),
+                frameRate = map.double("demux-fps")?.toFloat() ?: Format.NO_VALUE.toFloat(),
+                pixelWidthHeightRatio = map.double("demux-par")?.toFloat()?.takeIf { it > 0f } ?: 1f,
+                rotationDegrees = map.long("demux-rotation")?.toInt() ?: 0,
             )
         }
         snapshot = VlcTrackSnapshot(
-            tracks = videoTracks + audioTracks + textTracks,
-            selectedAudioId = runCatching { mediaPlayer.getAudioTrack() }.getOrDefault(-1),
-            selectedVideoId = runCatching { mediaPlayer.getVideoTrack() }.getOrDefault(-1),
-            selectedTextId = runCatching { mediaPlayer.getSpuTrack() }.getOrDefault(-1),
+            tracks = mapped,
+            selectedAudioId = selectedTrackId(core, "aid"),
+            selectedVideoId = selectedTrackId(core, "vid"),
+            selectedTextId = selectedTrackId(core, "sid"),
         )
-        durationMs = runCatching { currentMedia?.getDuration() ?: mediaPlayer.getLength() }
-            .getOrDefault(durationMs)
-            .takeIf { it >= 0L }
-            ?: durationMs
-        seekable = runCatching { mediaPlayer.isSeekable() }.getOrDefault(seekable)
+        emit(VlcEngineEvent(VlcEngineEvent.Kind.TRACKS_CHANGED, tracks = snapshot))
     }
 
-    private fun currentVideoSize(): VlcVideoSize? = snapshot.tracks
-        .firstOrNull { it.type == VlcTrackType.VIDEO && it.id == snapshot.selectedVideoId }
-        ?.let { VlcVideoSize(it.width, it.height, it.pixelWidthHeightRatio, it.rotationDegrees) }
+    private fun refreshVideoSize() {
+        val core = mpv ?: return
+        val node = core.getPropertyNode("video-out-params")
+            ?: core.getPropertyNode("video-params")
+            ?: return
+        publishVideoSize(node)
+    }
+
+    private fun publishVideoSize(node: MPVNode) {
+        val map = node.asMap() ?: return
+        val width = map.long("dw")?.toInt() ?: map.long("w")?.toInt() ?: return
+        val height = map.long("dh")?.toInt() ?: map.long("h")?.toInt() ?: return
+        if (width <= 0 || height <= 0) return
+        val ratio = map.double("aspect")
+            ?.takeIf { it > 0.0 }
+            ?.let { (it / (width.toDouble() / height)).toFloat() }
+            ?: 1f
+        emit(
+            VlcEngineEvent(
+                VlcEngineEvent.Kind.VOUT,
+                videoSize = VlcVideoSize(width, height, ratio, map.long("rotate")?.toInt() ?: 0),
+            ),
+        )
+    }
+
+    private fun selectedTrackId(core: MPV, property: String): Int =
+        core.getPropertyString(property)?.toIntOrNull() ?: -1
+
+    private fun selectTrack(property: String, id: Int) {
+        dispatch("select track") { core ->
+            if (selectedTrackId(core, property) == id) return@dispatch
+            if (id < 0) core.setPropertyString(property, "no") else core.setPropertyInt(property, id)
+            refreshTracks()
+        }
+    }
+
+    private fun attachSurfaceAsync(surface: Surface, width: Int, height: Int) {
+        if (!surface.isValid) return
+        dispatch("attach surface") { core ->
+            if (!surface.isValid) return@dispatch
+            if (attachedSurface !== surface) {
+                detachSurface(core)
+                core.attachSurface(surface)
+                attachedSurface = surface
+            }
+            if (width > 0 && height > 0) {
+                core.setPropertyString("android-surface-size", "${width}x$height")
+                emit(
+                    VlcEngineEvent(
+                        VlcEngineEvent.Kind.SURFACE_SIZE_CHANGED,
+                        surfaceSize = VlcSurfaceSize(width, height),
+                    ),
+                )
+            }
+            core.setPropertyString("vo", VIDEO_OUTPUT)
+            core.setPropertyString("force-window", "yes")
+        }
+    }
+
+    private fun detachSurfaceAsync(
+        expectedSurface: Surface? = null,
+        releaseAfterDetach: Surface? = null,
+    ) {
+        dispatch("detach surface") { core ->
+            if (expectedSurface == null || attachedSurface === expectedSurface) detachSurface(core)
+            releaseAfterDetach?.release()
+        }
+    }
+
+    private fun detachSurface(core: MPV) {
+        if (attachedSurface == null) return
+        // Match mpv-android: deinitialize the VO before dropping the Java Surface reference.
+        core.setPropertyString("vo", "null")
+        core.setPropertyString("force-window", "no")
+        core.detachSurface()
+        attachedSurface = null
+    }
+
+    private fun removeOutputCallbacks() {
+        when (val current = output) {
+            is SurfaceView -> current.holder.removeCallback(surfaceCallback)
+            is SurfaceHolder -> current.removeCallback(surfaceCallback)
+            is TextureView -> if (current.surfaceTextureListener === textureListener) {
+                current.surfaceTextureListener = null
+            }
+        }
+        val owned = ownedTextureSurface
+        ownedSurfaceTexture = null
+        ownedTextureSurface = null
+        if (owned != null) {
+            detachSurfaceAsync(expectedSurface = owned, releaseAfterDetach = owned)
+        }
+    }
+
+    private fun unloadCurrentMedia(core: MPV) {
+        runCatching { core.command("stop") }
+        fileLoaded = false
+        pendingSource?.close()
+        pendingSubtitles.forEach(OpenedMpvSubtitle::close)
+        // A source which already produced END_FILE has no native readers and can close now.
+        // Otherwise its lease is retained until the matching playlist_entry_id ends.
+        activeLease?.takeIf { it.ended }?.close()
+        pendingSource = null
+        pendingSourceGeneration = 0L
+        activeSource = null
+        activeSourceGeneration = 0L
+        pendingSubtitles = emptyList()
+        activeSubtitles = emptyList()
+        activeLease = null
+        activeEntryId = null
+        configuredSubtitles = emptyList()
+        snapshot = VlcTrackSnapshot()
+    }
+
+    private fun closeSources() {
+        pendingSource?.close()
+        pendingSubtitles.forEach(OpenedMpvSubtitle::close)
+        activeLease?.close()
+        awaitingStartLeases.forEach(MpvSourceLease::close)
+        leasesByEntryId.values.forEach(MpvSourceLease::close)
+        nativeLease?.close()
+        awaitingStartLeases.clear()
+        leasesByEntryId.clear()
+        activeEntryId = null
+        nativeLease = null
+        nativeEntryId = null
+        pendingSource = null
+        pendingSourceGeneration = 0L
+        activeSource = null
+        activeSourceGeneration = 0L
+        pendingSubtitles = emptyList()
+        activeSubtitles = emptyList()
+        activeLease = null
+    }
+
+    private fun openSource(uri: Uri): OpenedMpvSource {
+        if (uri.scheme.equals("syncplaysmb", ignoreCase = true)) {
+            throw IOException("Direct SMB is handled by AndroidX Media3; use a system SMB document provider for MPV")
+        }
+        return openMpvLocation(appContext.contentResolver, uri)
+    }
+
+    private fun openSubtitle(
+        subtitle: VlcExternalSubtitle,
+        job: SubtitleLoadJob,
+    ): OpenedMpvSubtitle = OpenedMpvSubtitle(
+        subtitle,
+        openMpvSubtitleLocation(
+            context = appContext,
+            subtitle = subtitle,
+            isCancelled = job::isCancelled,
+            onInputOpened = job::attachInput,
+        ),
+    )
+
+    private fun scheduleSubtitleLoad(
+        generation: Long,
+        subtitles: List<VlcExternalSubtitle>,
+    ) {
+        if (subtitles.isEmpty() || released || generation != mediaGeneration.get()) return
+        val job = SubtitleLoadJob()
+        subtitleLoad.getAndSet(job)?.cancel()
+        val future = subtitleExecutor.submit {
+            val opened = mutableListOf<OpenedMpvSubtitle>()
+            var transferred = false
+            try {
+                for (subtitle in subtitles) {
+                    if (job.isCancelled() || generation != mediaGeneration.get()) break
+                    // A stale or inaccessible sidecar is non-fatal to the movie itself.
+                    runCatching { openSubtitle(subtitle, job) }.getOrNull()?.let(opened::add)
+                }
+                if (job.isCancelled() || generation != mediaGeneration.get()) return@submit
+                transferred = commandHandler.post {
+                    if (released || generation != mediaGeneration.get()) {
+                        opened.forEach(OpenedMpvSubtitle::close)
+                        return@post
+                    }
+                    when {
+                        pendingSource != null && pendingSourceGeneration == generation -> {
+                            pendingSubtitles.forEach(OpenedMpvSubtitle::close)
+                            pendingSubtitles = opened
+                        }
+                        activeSource != null && activeSourceGeneration == generation -> {
+                            activeSubtitles = opened
+                            activeLease?.addSubtitles(opened)
+                            val core = mpv
+                            if (core != null && fileLoaded && isCurrentNativeLoad()) {
+                                addExternalSubtitles(core, opened)
+                                refreshTracks()
+                            }
+                        }
+                        else -> opened.forEach(OpenedMpvSubtitle::close)
+                    }
+                }
+            } finally {
+                subtitleLoad.compareAndSet(job, null)
+                if (!transferred) opened.forEach(OpenedMpvSubtitle::close)
+            }
+        }
+        job.attachFuture(future)
+    }
+
+    private fun cancelSubtitleLoad() {
+        subtitleLoad.getAndSet(null)?.cancel()
+    }
+
+    private fun dispatch(operation: String, block: (MPV) -> Unit) {
+        if (released) return
+        commandHandler.post {
+            if (released) return@post
+            val core = mpv
+            if (core == null) {
+                initializationError?.let(::emitPlaybackError)
+                return@post
+            }
+            runCatching { block(core) }.onFailure { error ->
+                emitPlaybackError(IOException("libmpv failed during $operation", error))
+            }
+        }
+    }
+
+    /** Keep every JNI callback failure contained so the native command looper remains alive. */
+    private fun postNativeEvent(operation: String, block: () -> Unit) {
+        if (released) return
+        commandHandler.post {
+            if (released) return@post
+            runCatching(block).onFailure { error ->
+                emitPlaybackError(IOException("libmpv failed while handling $operation", error))
+            }
+        }
+    }
 
     private fun emit(event: VlcEngineEvent) {
-        if (!released) listener?.invoke(event)
+        val callback = listener ?: return
+        eventHandler.post { if (!released && listener === callback) callback(event) }
     }
 
-    private fun installMediaPlayerListener(generation: Long) {
-        mediaPlayer.setEventListener(MediaPlayer.EventListener { event ->
-            // Posts already queued for the prior item retain its captured generation. This keeps
-            // a late Stopped/TimeChanged/Error callback from changing the newly installed item.
-            eventHandler.post {
-                if (!released && mediaGeneration == generation) handlePlayerEvent(event)
-            }
-        })
+    private fun emitPlaybackError(error: Throwable) {
+        emit(VlcEngineEvent(VlcEngineEvent.Kind.ENCOUNTERED_ERROR, error = error))
     }
 
-    private fun applyPendingSeek(force: Boolean) {
-        val target = pendingSeekPositionMs ?: return
-        if (!force && !runCatching { mediaPlayer.isSeekable() }.getOrDefault(false)) return
-        // Fast seeking lands on the closest usable point and avoids decoding a long HEVC GOP just
-        // to service a scrub/synchronization correction. Small residual drift is handled by the
-        // normal Syncplay rate-correction path.
-        runCatching { mediaPlayer.setTime(target, true) }
-            .onSuccess { appliedPosition ->
-                if (appliedPosition >= 0L &&
-                    kotlin.math.abs(appliedPosition - target) <= SEEK_CONFIRMATION_TOLERANCE_MS
-                ) {
-                    positionMs = appliedPosition
-                    pendingSeekPositionMs = null
-                }
-            }
-            .onFailure { error ->
-                emit(VlcEngineEvent(VlcEngineEvent.Kind.ENCOUNTERED_ERROR, error = error))
-            }
+    private fun stage(name: String) {
+        eventHandler.post { if (!released) onInitializationStage(name) }
     }
 
-    private fun stopAndReleaseMedia() {
-        // Replacing an item while LibVLC is still decoding can leave native events queued for the
-        // old media. Stop first, invalidate its generation, detach MediaPlayer's reference, then
-        // drop our Media reference and provider descriptors.
-        val media = currentMedia
-        runCatching { mediaPlayer.setEventListener(null) }
-        if (media != null) runCatching { mediaPlayer.stop() }
-        mediaGeneration++
-        pendingSeekPositionMs = null
-        currentMedia = null
-        media?.let {
-            runCatching { it.setEventListener(null) }
-            // MediaPlayer retains the IMedia supplied to setMedia. Detach it before releasing
-            // our reference and provider descriptors so clearMedia does not keep a stale native
-            // item alive until another video happens to be installed.
-            runCatching { mediaPlayer.setMedia(null) }
-            runCatching { it.release() }
-        }
-        runCatching { sourceDescriptor?.close() }
-        sourceDescriptor = null
-        subtitleDescriptors.toList().forEach { descriptor -> runCatching { descriptor.close() } }
-        subtitleDescriptors.clear()
-    }
-
-    private data class OpenedMedia(
-        val media: Media,
-        val descriptor: Closeable?,
-    )
-
-    private data class OpenedSubtitle(
-        val vlcUri: Uri,
-        val descriptor: ParcelFileDescriptor?,
-    )
-
-    /**
-     * LibVLC's Uri constructor forwards `content://` literally to the native core, which cannot
-     * ask a DocumentsProvider for bytes. Prefer the public descriptor constructors for provider
-     * URIs and retain the descriptor until the media is released. Other URI schemes (including
-     * the already-normalised SMB URI) continue through LibVLC's normal location constructor.
-     */
-    private fun openMedia(uri: Uri, profile: SmbConnectionProfile?): OpenedMedia {
-        if (profile != null) {
-            return OpenedMedia(Media(libVlc, uri.toLibVlcUri(profile)), descriptor = null)
-        }
-        if (!uri.scheme.equals(ContentResolver.SCHEME_CONTENT, ignoreCase = true)) {
-            return OpenedMedia(Media(libVlc, uri), descriptor = null)
-        }
-
-        val resolver = appContext.contentResolver
-        var assetError: Throwable? = null
-        val asset = try {
-            resolver.openAssetFileDescriptor(uri, READ_MODE)
-        } catch (error: Throwable) {
-            assetError = error
-            null
-        }
-        if (asset != null) {
-            return try {
-                OpenedMedia(Media(libVlc, asset), descriptor = asset)
-            } catch (error: Throwable) {
-                runCatching { asset.close() }
-                throw error
+    private fun ensureCertificateBundle(): File {
+        val directory = File(appContext.filesDir, "mpv").apply { mkdirs() }
+        val destination = File(directory, "cacert.pem")
+        if (!destination.isFile || destination.length() == 0L) {
+            appContext.assets.open("cacert.pem").use { source ->
+                destination.outputStream().buffered().use { target -> source.copyTo(target) }
             }
         }
-
-        val descriptor = try {
-            resolver.openFileDescriptor(uri, READ_MODE)
-        } catch (error: Throwable) {
-            val wrapped = IOException("Unable to open content URI for LibVLC", error)
-            assetError?.let(wrapped::addSuppressed)
-            throw wrapped
-        } ?: run {
-            val wrapped = IOException("Content provider returned no file descriptor")
-            assetError?.let(wrapped::addSuppressed)
-            throw wrapped
-        }
-        return try {
-            OpenedMedia(Media(libVlc, descriptor.fileDescriptor), descriptor = descriptor)
-        } catch (error: Throwable) {
-            runCatching { descriptor.close() }
-            throw error
-        }
+        return destination
     }
 
-    /**
-     * Resolve provider-backed subtitle streams to an `fd://` MRL. LibVLC's slave API only accepts
-     * URI strings, so passing the SAF URI itself would make the native core try to open
-     * `content://` without an Android ContentResolver. A duplicated ParcelFileDescriptor keeps
-     * the descriptor alive until the slave is removed/released. Asset descriptors with a non-zero
-     * offset cannot be represented by `fd://`; reopen those through openFileDescriptor instead.
-     */
-    private fun openSubtitle(uri: Uri, profile: SmbConnectionProfile?): OpenedSubtitle {
-        if (profile != null) {
-            return OpenedSubtitle(uri.toLibVlcUri(profile), descriptor = null)
-        }
-        if (!uri.scheme.equals(ContentResolver.SCHEME_CONTENT, ignoreCase = true)) {
-            return OpenedSubtitle(uri, descriptor = null)
-        }
-
-        val resolver = appContext.contentResolver
-        val asset = runCatching { resolver.openAssetFileDescriptor(uri, READ_MODE) }.getOrNull()
-        if (asset != null) {
-            val startOffset = asset.startOffset
-            if (startOffset == 0L) {
-                val duplicate = runCatching { asset.parcelFileDescriptor.dup() }.getOrNull()
-                runCatching { asset.close() }
-                if (duplicate != null) return OpenedSubtitle(fdUri(duplicate), duplicate)
-            } else {
-                // The fd:// form has no offset/length fields. Closing this AFD before reopening
-                // avoids leaking the provider's original descriptor on providers that expose a
-                // ZIP/asset subrange.
-                runCatching { asset.close() }
-            }
-        }
-
-        val descriptor = resolver.openFileDescriptor(uri, READ_MODE)
-            ?: throw IOException("Content provider returned no subtitle descriptor")
-        return try {
-            OpenedSubtitle(fdUri(descriptor), descriptor)
-        } catch (error: Throwable) {
-            runCatching { descriptor.close() }
-            throw error
-        }
-    }
-
-    private fun fdUri(descriptor: ParcelFileDescriptor): Uri = fdUriForDescriptor(descriptor.fd)
-
-    private fun orientationToRotation(orientation: Int): Int = when (orientation) {
-        5, 6 -> 90
-        2, 3 -> 180
-        7, 4 -> 270
-        else -> 0
-    }
+    private fun secondsToMs(value: Double): Long = (value * 1_000.0).toLong().coerceAtLeast(0L)
+    private fun seconds(valueMs: Long): Double = valueMs / 1_000.0
 
     companion object {
-        private const val READ_MODE = "r"
-        private const val SEEK_CONFIRMATION_TOLERANCE_MS = 1_500L
+        private const val VIDEO_OUTPUT = "gpu"
 
-        /** Enough read-ahead for Wi-Fi/SMB jitter without turning every seek into a long stall. */
-        val DEFAULT_OPTIONS: List<String> = listOf(
-            "--no-video-title-show",
-            "--avcodec-hw=any",
-            "--network-caching=2000",
-            "--file-caching=1000",
+        /**
+         * `mediacodec` attempts zero-copy GPU interop first; copy-back is the compatible hardware
+         * fallback and mpv falls back to software when a vendor decoder rejects HEVC Main10.
+         * `mediacodec_embed` is intentionally absent because it cannot render ASS/PGS/OSD.
+         */
+        val DEFAULT_OPTIONS: Map<String, String> = linkedMapOf(
+            "config" to "no",
+            "profile" to "fast",
+            "vo" to VIDEO_OUTPUT,
+            "gpu-context" to "android",
+            "gpu-api" to "opengl",
+            "opengl-es" to "yes",
+            "hwdec" to "mediacodec,mediacodec-copy",
+            "hwdec-codecs" to "h264,hevc,mpeg4,mpeg2video,vp8,vp9,av1",
+            "ao" to "audiotrack,opensles",
+            "interpolation" to "no",
+            "video-sync" to "audio",
+            "hr-seek" to "yes",
+            "hr-seek-framedrop" to "yes",
+            "vd-lavc-threads" to "0",
+            "cache" to "yes",
+            "cache-pause" to "yes",
+            "cache-pause-initial" to "yes",
+            "demuxer-readahead-secs" to "30",
+            "demuxer-max-bytes" to "134217728",
+            "demuxer-max-back-bytes" to "33554432",
+            "sub-auto" to "no",
+            "sub-ass" to "yes",
+            "embeddedfonts" to "yes",
+            "osc" to "no",
+            "osd-level" to "0",
+            "input-default-bindings" to "no",
+            "idle" to "yes",
+            "keep-open" to "no",
+            "audio-pitch-correction" to "yes",
         )
+
+        private val OBSERVED_PROPERTIES = mapOf(
+            "time-pos" to MPV.mpvFormat.MPV_FORMAT_DOUBLE,
+            "duration" to MPV.mpvFormat.MPV_FORMAT_DOUBLE,
+            "pause" to MPV.mpvFormat.MPV_FORMAT_FLAG,
+            "paused-for-cache" to MPV.mpvFormat.MPV_FORMAT_FLAG,
+            "seeking" to MPV.mpvFormat.MPV_FORMAT_FLAG,
+            "seekable" to MPV.mpvFormat.MPV_FORMAT_FLAG,
+            "eof-reached" to MPV.mpvFormat.MPV_FORMAT_FLAG,
+            "cache-buffering-state" to MPV.mpvFormat.MPV_FORMAT_DOUBLE,
+            "track-list" to MPV.mpvFormat.MPV_FORMAT_NODE,
+            "sid" to MPV.mpvFormat.MPV_FORMAT_STRING,
+            "aid" to MPV.mpvFormat.MPV_FORMAT_STRING,
+            "vid" to MPV.mpvFormat.MPV_FORMAT_STRING,
+            "video-out-params" to MPV.mpvFormat.MPV_FORMAT_NODE,
+            "video-params" to MPV.mpvFormat.MPV_FORMAT_NODE,
+        )
+    }
+}
+
+/** Source retained for as long as mpv may read its descriptor. */
+data class OpenedMpvSource(
+    val location: String,
+    private val descriptor: ParcelFileDescriptor? = null,
+    private val temporaryFile: File? = null,
+) : Closeable {
+    override fun close() {
+        descriptor?.close()
+        temporaryFile?.delete()
+    }
+}
+
+private data class OpenedMpvSubtitle(
+    val metadata: VlcExternalSubtitle,
+    val source: OpenedMpvSource,
+) : Closeable {
+    override fun close() = source.close()
+}
+
+/** Descriptor ownership for one loadfile request; close is intentionally idempotent. */
+private class MpvSourceLease(
+    val source: OpenedMpvSource,
+    subtitles: List<OpenedMpvSubtitle>,
+) : Closeable {
+    var ended: Boolean = false
+    private val subtitles = subtitles.toMutableList()
+    private var closed = false
+
+    fun addSubtitles(additional: List<OpenedMpvSubtitle>) {
+        if (closed) {
+            additional.forEach(OpenedMpvSubtitle::close)
+        } else {
+            subtitles.addAll(additional)
+        }
+    }
+
+    override fun close() {
+        if (closed) return
+        closed = true
+        runCatching(source::close)
+        subtitles.forEach { runCatching(it::close) }
+    }
+}
+
+/** Cancellation closes the active provider stream; interruption alone is unreliable for SMB. */
+private class SubtitleLoadJob {
+    private val cancelled = AtomicBoolean(false)
+    @Volatile private var input: InputStream? = null
+    @Volatile private var future: Future<*>? = null
+
+    fun isCancelled(): Boolean = cancelled.get() || Thread.currentThread().isInterrupted
+
+    fun attachInput(input: InputStream) {
+        this.input = input
+        if (cancelled.get()) runCatching(input::close)
+    }
+
+    fun attachFuture(future: Future<*>) {
+        this.future = future
+        if (cancelled.get()) future.cancel(true)
+    }
+
+    fun cancel() {
+        cancelled.set(true)
+        runCatching { input?.close() }
+        future?.cancel(true)
+    }
+}
+
+/** Resolve Android provider URIs without copying a multi-gigabyte movie into app storage. */
+internal fun openMpvLocation(contentResolver: ContentResolver, uri: Uri): OpenedMpvSource =
+    when (uri.scheme?.lowercase(Locale.ROOT)) {
+        ContentResolver.SCHEME_CONTENT -> openMpvContentLocation(contentResolver, uri)
+        ContentResolver.SCHEME_FILE -> OpenedMpvSource(
+            uri.path?.takeIf(String::isNotBlank) ?: throw IOException("File URI has no path"),
+        )
+        "http", "https", "rtmp", "rtmps", "rtsp", "ftp", "data" -> OpenedMpvSource(uri.toString())
+        null -> OpenedMpvSource(uri.toString())
+        else -> throw IOException("Unsupported media URI scheme")
+    }
+
+/** Prefer an asset descriptor for slice offsets, then support providers exposing only a PFD. */
+private fun openMpvContentLocation(
+    contentResolver: ContentResolver,
+    uri: Uri,
+): OpenedMpvSource {
+    var assetFailure: Throwable? = null
+    val asset = runCatching { contentResolver.openAssetFileDescriptor(uri, "r") }
+        .onFailure { assetFailure = it }
+        .getOrNull()
+    if (asset != null) {
+        try {
+            val duplicate = ParcelFileDescriptor.dup(asset.fileDescriptor)
+            try {
+                ensureSeekable(duplicate)
+                val fdLocation = fdMrlForDescriptor(duplicate.fd)
+                val length = asset.length
+                val location = when {
+                    asset.startOffset > 0L && length != AssetFileDescriptor.UNKNOWN_LENGTH ->
+                        "slice://${asset.startOffset}-${asset.startOffset + length}@$fdLocation"
+                    asset.startOffset > 0L -> "slice://${asset.startOffset}@$fdLocation"
+                    length != AssetFileDescriptor.UNKNOWN_LENGTH -> "slice://0-$length@$fdLocation"
+                    else -> fdLocation
+                }
+                return OpenedMpvSource(location, duplicate)
+            } catch (error: Throwable) {
+                duplicate.close()
+                assetFailure = error
+            }
+        } finally {
+            asset.close()
+        }
+    }
+
+    val descriptor = try {
+        contentResolver.openFileDescriptor(uri, "r")
+    } catch (error: Exception) {
+        throw IOException("Unable to open Android document provider", error).also { wrapped ->
+            assetFailure?.let(wrapped::addSuppressed)
+        }
+    } ?: throw IOException("Android document provider returned no file descriptor").also { wrapped ->
+        assetFailure?.let(wrapped::addSuppressed)
+    }
+    try {
+        ensureSeekable(descriptor)
+        return OpenedMpvSource(fdMrlForDescriptor(descriptor.fd), descriptor)
+    } catch (error: Throwable) {
+        descriptor.close()
+        throw IOException("Unable to retain a seekable Android document descriptor", error).also { wrapped ->
+            assetFailure?.let(wrapped::addSuppressed)
+        }
     }
 }
 
 /**
- * Convert the credential-free app URI into LibVLC's regular SMB URI. This function deliberately
- * keeps user-info out of the authority; credentials are supplied as media options instead.
+ * Materialize a small provider/SMB subtitle with its real extension. Passing `fd://42` to
+ * `sub-add` discards the name, which can make ASS/SRT probing unreliable. Movies never take this
+ * path, so a multi-gigabyte video is not copied into app storage.
  */
-internal fun Uri.toLibVlcUri(profile: SmbConnectionProfile?): Uri {
-    if (profile == null) return this
-    val location = SmbUri.parse(this)
-    return Uri.parse(smbLocationToLibVlcMrl(location, profile))
-}
-
-/** Pure MRL construction kept separate from Android [Uri] calls for deterministic unit tests. */
-internal fun smbLocationToLibVlcMrl(
-    location: SmbLocation,
-    profile: SmbConnectionProfile,
-): String {
-    val host = profile.host
-    require(host == host.trim() && host.isNotEmpty()) { "SMB host must not contain surrounding whitespace" }
-    require(host.none { it.isWhitespace() || it == '/' || it == '\\' || it == '@' || it == '?' || it == '#' }) {
-        "SMB host contains an unsupported character"
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+internal fun openMpvSubtitleLocation(
+    context: Context,
+    subtitle: VlcExternalSubtitle,
+    isCancelled: () -> Boolean = { false },
+    onInputOpened: (InputStream) -> Unit = {},
+): OpenedMpvSource {
+    if (isCancelled()) throw InterruptedIOException("Subtitle loading was cancelled")
+    val uri = subtitle.uri
+    if (!uri.scheme.equals(ContentResolver.SCHEME_CONTENT, ignoreCase = true) && !SmbUri.isSmbUri(uri)) {
+        return openMpvLocation(context.contentResolver, uri)
     }
-    val authorityHost = if (host.contains(':') && !host.startsWith('[') && !host.endsWith(']')) {
-        "[$host]"
-    } else {
-        host
-    }
-    val pathSegments = listOf(location.shareName) +
-        SmbUriPathSegments.from(location.path)
-    val encodedPath = pathSegments.joinToString(
-        separator = "/",
-        prefix = "/",
-    ) { encodeSmbSegment(it) }
-    return "smb://$authorityHost:${profile.port}$encodedPath"
-}
-
-private object SmbUriPathSegments {
-    fun from(path: String): List<String> = if (path.isEmpty()) emptyList() else path.split('/')
-}
-
-private const val SMB_SEGMENT_ALLOWED = "-_.~!$&'()*+,;=:@"
-
-private fun encodeSmbSegment(value: String): String {
-    val bytes = value.toByteArray(Charsets.UTF_8)
-    val result = StringBuilder(bytes.size)
-    bytes.forEach { byte ->
-        val code = byte.toInt() and 0xff
-        val character = code.toChar()
-        if (character in 'a'..'z' || character in 'A'..'Z' || character in '0'..'9' ||
-            SMB_SEGMENT_ALLOWED.indexOf(character) >= 0
-        ) {
-            result.append(character)
+    val extension = subtitleExtension(subtitle)
+    val destination = File.createTempFile("syncplay-subtitle-", ".$extension", context.cacheDir)
+    try {
+        val input: InputStream = if (SmbUri.isSmbUri(uri)) {
+            DataSourceInputStream(
+                SmbPlaybackEnvironment.dataSourceFactory(context).createDataSource(),
+                DataSpec(uri),
+            ).apply { open() }
         } else {
-            result.append('%')
-            result.append(HEX_DIGITS[code ushr 4])
-            result.append(HEX_DIGITS[code and 0x0f])
+            context.contentResolver.openInputStream(uri)
+                ?: throw IOException("Android document provider returned no subtitle stream")
         }
+        onInputOpened(input)
+        if (isCancelled()) throw InterruptedIOException("Subtitle loading was cancelled")
+        input.use { source ->
+            destination.outputStream().buffered().use { target ->
+                val buffer = ByteArray(SUBTITLE_COPY_BUFFER_BYTES)
+                var total = 0L
+                while (true) {
+                    if (isCancelled()) throw InterruptedIOException("Subtitle loading was cancelled")
+                    val count = source.read(buffer)
+                    if (count < 0) break
+                    if (count == 0) continue
+                    total += count
+                    if (total > MAX_EXTERNAL_SUBTITLE_BYTES) {
+                        throw IOException("External subtitle is larger than the supported limit")
+                    }
+                    target.write(buffer, 0, count)
+                }
+            }
+        }
+        if (isCancelled()) throw InterruptedIOException("Subtitle loading was cancelled")
+        return OpenedMpvSource(destination.absolutePath, temporaryFile = destination)
+    } catch (error: Throwable) {
+        destination.delete()
+        if (error is IOException) throw error
+        throw IOException("Unable to cache external subtitle", error)
     }
-    return result.toString()
 }
 
-private const val HEX_DIGITS = "0123456789ABCDEF"
-
-/** Pure `fd://` MRL construction kept visible for descriptor/SAF tests. */
-internal fun fdUriForDescriptor(fd: Int): Uri {
-    return Uri.parse(fdMrlForDescriptor(fd))
+private fun ensureSeekable(descriptor: ParcelFileDescriptor) {
+    try {
+        val position = Os.lseek(descriptor.fileDescriptor, 0L, OsConstants.SEEK_CUR)
+        Os.lseek(descriptor.fileDescriptor, position, OsConstants.SEEK_SET)
+    } catch (error: ErrnoException) {
+        throw IOException("The selected document provider does not support random access", error)
+    }
 }
 
+private fun subtitleExtension(subtitle: VlcExternalSubtitle): String {
+    val pathExtension = listOfNotNull(subtitle.label, subtitle.uri.lastPathSegment)
+        .asSequence()
+        .map { Uri.decode(it).substringAfterLast('.', missingDelimiterValue = "").lowercase(Locale.ROOT) }
+        .firstOrNull { it in SUPPORTED_SUBTITLE_EXTENSIONS }
+    if (pathExtension != null) return pathExtension
+    return when (subtitle.mimeType?.lowercase(Locale.ROOT)) {
+        "text/x-ssa", "text/x-ass", "application/x-ass", "application/x-ssa" -> "ass"
+        "text/vtt" -> "vtt"
+        "application/ttml+xml" -> "ttml"
+        else -> "srt"
+    }
+}
+
+/** Pure descriptor MRL construction used by source tests. */
 internal fun fdMrlForDescriptor(fd: Int): String {
     require(fd >= 0) { "File descriptor must be non-negative" }
     return "fd://$fd"
 }
 
-/** Match LibVLC's slave display name to Media3 subtitle metadata without exposing a URI. */
-internal fun descriptionMatchesSubtitle(
-    description: String?,
+internal fun externalTrackMatches(
     subtitle: VlcExternalSubtitle,
-): Boolean = subtitleDescriptionMatches(
-    description = description,
-    label = subtitle.label,
-    path = subtitle.uri.lastPathSegment,
-)
+    title: String?,
+    externalFilename: String?,
+): Boolean {
+    return subtitleMetadataMatches(
+        title = title,
+        externalFilename = externalFilename,
+        id = subtitle.id,
+        label = subtitle.label,
+        path = subtitle.uri.lastPathSegment,
+    )
+}
 
-/** Pure subtitle-name matcher used by the LibVLC adapter and JVM tests. */
-internal fun subtitleDescriptionMatches(
-    description: String?,
+internal fun subtitleMetadataMatches(
+    title: String?,
+    externalFilename: String?,
+    id: String?,
     label: String?,
     path: String?,
 ): Boolean {
-    val descriptionText = description?.trim().orEmpty()
-    if (descriptionText.isEmpty()) return false
-    val descriptionKey = subtitleMatchKey(descriptionText)
-    return listOfNotNull(
-        label,
-        path,
-    ).any { candidate ->
-        val candidateText = decodeUriComponent(candidate).substringAfterLast('/').trim()
-        if (candidateText.isEmpty()) return@any false
-        val candidateKey = subtitleMatchKey(candidateText)
-        candidateText.equals(descriptionText, ignoreCase = true) ||
-            descriptionText.contains(candidateText, ignoreCase = true) ||
-            candidateText.contains(descriptionText, ignoreCase = true) ||
-            (descriptionKey.isNotEmpty() && candidateKey.isNotEmpty() && descriptionKey.contains(candidateKey))
-    }
+    val stableId = id?.takeIf(String::isNotBlank)
+    if (stableId != null && title == stableId) return true
+    val candidates = listOfNotNull(label, path)
+        .map(::subtitleMatchKey)
+        .filter(String::isNotEmpty)
+    return listOfNotNull(title, externalFilename)
+        .map(::subtitleMatchKey)
+        .any { actual -> candidates.any { expected -> actual.contains(expected) || expected.contains(actual) } }
 }
 
-private fun subtitleMatchKey(value: String): String = value
+private fun subtitleMatchKey(value: String): String = decodeUriComponent(value)
+    .substringAfterLast('/')
     .lowercase(Locale.ROOT)
     .substringBeforeLast('.')
     .filter(Char::isLetterOrDigit)
 
+/** Percent decoder kept Android-free so matching behavior is covered by local JVM tests. */
 private fun decodeUriComponent(value: String): String {
     if ('%' !in value) return value
     val bytes = java.io.ByteArrayOutputStream(value.length)
@@ -891,14 +1300,27 @@ private fun decodeUriComponent(value: String): String {
     return result.toString()
 }
 
-/** Add credentials as LibVLC media options, never as URI user-info or diagnostic metadata. */
-private fun SmbConnectionProfile.applyCredentials(media: Media) {
-    if (username.isNotEmpty()) media.addOption(":smb-user=$username")
-    val password = passwordCopy()
-    try {
-        if (password.isNotEmpty()) media.addOption(":smb-pwd=${String(password)}")
-    } finally {
-        password.fill('\u0000')
-    }
-    domain?.takeIf { it.isNotEmpty() }?.let { media.addOption(":smb-domain=$it") }
+private fun parseChannelCount(channels: String?): Int = when (channels?.trim()?.lowercase(Locale.ROOT)) {
+    "mono" -> 1
+    "stereo" -> 2
+    "2.1", "3.0" -> 3
+    "quad", "4.0" -> 4
+    "5.0" -> 5
+    "5.1" -> 6
+    "6.1" -> 7
+    "7.1" -> 8
+    else -> Format.NO_VALUE
 }
+
+private fun Map<String, MPVNode>.string(key: String): String? = get(key)?.asString()
+private fun Map<String, MPVNode>.long(key: String): Long? = get(key)?.asInt()
+private fun Map<String, MPVNode>.double(key: String): Double? = when (val node = get(key)) {
+    is MPVNode.DoubleNode -> node.value
+    is MPVNode.IntNode -> node.value.toDouble()
+    else -> null
+}
+private fun Map<String, MPVNode>.boolean(key: String): Boolean? = get(key)?.asBoolean()
+
+private const val SUBTITLE_COPY_BUFFER_BYTES = 64 * 1024
+private const val MAX_EXTERNAL_SUBTITLE_BYTES = 64L * 1024L * 1024L
+private val SUPPORTED_SUBTITLE_EXTENSIONS = setOf("srt", "ass", "ssa", "vtt", "ttml")

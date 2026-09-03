@@ -11,8 +11,8 @@ android {
         applicationId = "dev.neura.syncplay"
         minSdk = 23
         targetSdk = 37
-        versionCode = 8
-        versionName = "0.3.2"
+        versionCode = 9
+        versionName = "0.3.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
@@ -80,8 +80,9 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-hls:$media3Version")
     implementation("androidx.media3:media3-session:$media3Version")
     implementation("androidx.media3:media3-ui:$media3Version")
-    // LibVLC's public LGPL Android binding; the adapter uses only this API surface.
-    implementation("org.videolan.android:libvlc-all:3.7.5")
+    // Native libmpv/FFmpeg/libass backend for demanding Matroska/HEVC sources. Media3 remains
+    // the app's Player/MediaSession contract; see THIRD_PARTY_NOTICES.md for GPLv3 obligations.
+    implementation("io.github.abdallahmehiz:mpv-android-lib:0.1.12")
 
     implementation("com.google.code.gson:gson:2.14.0")
     // SMBJ is Apache-2.0 licensed and provides the in-process SMB2/SMB3 transport used by

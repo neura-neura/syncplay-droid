@@ -11,6 +11,6 @@ Syncplay authors and contributors:
 
 This product uses AndroidX Media3 and other AndroidX components, Gson, Kotlin, and kotlinx
 coroutines. It also uses SMBJ (com.hierynomus:smbj), licensed under the Apache License,
-Version 2.0, and LibVLC Android (org.videolan.android:libvlc-all), licensed under the GNU
-Lesser General Public License, version 2.1 or later. Their respective licenses and notices
-remain applicable.
+Version 2.0, and mpv-android-lib (io.github.abdallahmehiz:mpv-android-lib), whose Kotlin/JNI
+wrapper is MIT-licensed and whose bundled mpv/FFmpeg build is GPL software. Their respective
+licenses and notices remain applicable. See THIRD_PARTY_NOTICES.md.

@@ -31,14 +31,15 @@ class VlcTrackMapperInstrumentedTest {
         )
 
         val tracks = VlcTrackMapper.toMedia3Tracks(snapshot)
-        assertEquals(3, tracks.groups.size)
+        assertEquals(4, tracks.groups.size)
         val video = tracks.groups.first { it.type == C.TRACK_TYPE_VIDEO }
         assertEquals(MimeTypes.VIDEO_H265, video.getTrackFormat(0).sampleMimeType)
         assertTrue(video.isTrackSelected(0))
-        val text = tracks.groups.first { it.type == C.TRACK_TYPE_TEXT }
-        assertEquals(2, text.length)
-        assertEquals("syncplay-external-subtitle:sub.srt", text.getTrackFormat(1).id)
-        assertTrue(text.isTrackSelected(1))
+        val text = tracks.groups.first { group ->
+            group.type == C.TRACK_TYPE_TEXT && group.getTrackFormat(0).id == "syncplay-external-subtitle:sub.srt"
+        }
+        assertEquals(1, text.length)
+        assertTrue(text.isTrackSelected(0))
     }
 
     @Test
@@ -48,7 +49,7 @@ class VlcTrackMapperInstrumentedTest {
         )
         val id = snapshot.tracks.single().media3FormatId()
         assertEquals(42, snapshot.engineTrackId(id))
-        assertEquals(42, snapshot.engineTrackId("vlc:text:42"))
+        assertEquals(42, snapshot.engineTrackId("mpv:2:42"))
         assertEquals(null, snapshot.engineTrackId("unrelated"))
     }
 
@@ -71,10 +72,11 @@ class VlcTrackMapperInstrumentedTest {
             ),
         )
 
-        val text = VlcTrackMapper.toMedia3Tracks(snapshot).groups.single()
-        assertEquals(MimeTypes.APPLICATION_SUBRIP, text.getTrackFormat(0).sampleMimeType)
-        assertEquals(MimeTypes.TEXT_SSA, text.getTrackFormat(1).sampleMimeType)
-        assertTrue(text.isTrackSupported(0))
-        assertTrue(text.isTrackSupported(1))
+        val text = VlcTrackMapper.toMedia3Tracks(snapshot).groups
+        assertEquals(2, text.size)
+        assertEquals(MimeTypes.APPLICATION_SUBRIP, text[0].getTrackFormat(0).sampleMimeType)
+        assertEquals(MimeTypes.TEXT_SSA, text[1].getTrackFormat(0).sampleMimeType)
+        assertTrue(text[0].isTrackSupported(0))
+        assertTrue(text[1].isTrackSupported(0))
     }
 }
