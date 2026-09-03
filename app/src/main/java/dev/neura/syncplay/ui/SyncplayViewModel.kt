@@ -465,9 +465,11 @@ class SyncplayViewModel(
                 // configurations here lets Media3 select the first DEFAULT
                 // track, which can leave an older video's subtitle visible.
                 desiredExternalSubtitleId = configuration.id
-                // Hide the embedded default while the new sidecar group is being prepared. The
-                // exact external override is installed as soon as Media3 publishes its tracks.
-                resetPlayerSubtitleSelection(disabled = true)
+                // Loading a subtitle is an explicit request to show it. Clear an older text
+                // override (including "Sin subtítulos") and leave text enabled while MPV adds
+                // the sidecar with `sub-add select`. The exact Media3 override is installed as
+                // soon as the new track is published.
+                resetPlayerSubtitleSelection(disabled = false)
                 val replacementConfigurations = subtitleConfigurations.replaceWithLatest(configuration)
                 if (reinstallCurrentMediaKeepingPosition(replacementConfigurations)) {
                     subtitleConfigurations = replacementConfigurations

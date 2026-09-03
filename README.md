@@ -14,7 +14,7 @@ The app speaks the standard Syncplay TCP/JSON protocol directly. Desktop partici
 using mpv, VLC, MPC-HC, MPC-BE, Noir Player, or another supported player integration: every client
 controls its own player while the Syncplay server coordinates play, pause, and position.
 
-[Download Syncplay Droid 0.3.3](https://github.com/neura-neura/syncplay-droid/releases/tag/v0.3.3)
+[Download Syncplay Droid 0.3.4](https://github.com/neura-neura/syncplay-droid/releases/tag/v0.3.4)
 
 ## Features
 
@@ -36,8 +36,9 @@ controls its own player while the Syncplay server coordinates play, pause, and p
   subtitle picker can switch between embedded tracks, disable subtitles, or open an external file.
 - Load external SRT, ASS/SSA, WebVTT, and TTML subtitles. SAF/SMB sidecars are handed to libmpv
   through short-lived extension-preserving cache files. The selected sidecar is explicitly
-  preferred over an embedded default track, selecting another sidecar replaces it, and changing
-  videos clears it.
+  preferred over an embedded default track, and a bundled Unicode fallback font keeps text
+  subtitles renderable on Android builds without a system font provider. Selecting another
+  sidecar replaces it, and changing videos clears it.
 - Use Media3 playback controls, fullscreen landscape playback, immersive mode, background playback,
   a media notification, and Android system media controls.
 - Synchronize play, pause, and seek in both directions, with speed-based drift correction for small
@@ -59,7 +60,7 @@ same path is available through an Android document provider.
 
 ## Quick start
 
-1. Install the APK from the [v0.3.3 release](https://github.com/neura-neura/syncplay-droid/releases/tag/v0.3.3).
+1. Install the APK from the [v0.3.4 release](https://github.com/neura-neura/syncplay-droid/releases/tag/v0.3.4).
 2. Enter the same server and exact room name as the desktop participants.
 3. Join the room and open your local copy, an HTTP(S) URL, or **SMB direct**.
 4. Open the **Room** tab and confirm that the file name, duration, and size match.
@@ -107,7 +108,7 @@ Instrumented tests require a connected device or emulator:
   logs, saved state, or preferences.
 - The built-in **SMB direct** browser remains on the positional Media3/SMBJ source. Selecting the
   same SMB file through Solid Explorer or another seekable document provider enables the MPV path.
-- The downloadable 0.3.3 APK is debug-signed and debuggable for direct testing. It is not a
+- The downloadable 0.3.4 APK is debug-signed and debuggable for direct testing. It is not a
   production-signed or Google Play build.
 
 ## Acknowledgements and license

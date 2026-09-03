@@ -1,6 +1,7 @@
 package dev.neura.syncplay.player.vlc
 
 import android.net.Uri
+import androidx.media3.common.C
 import androidx.media3.common.MimeTypes
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -75,6 +76,7 @@ class VlcFixturePlaybackTest {
                                 uri = Uri.fromFile(externalSubtitle),
                                 label = externalSubtitle.name,
                                 mimeType = MimeTypes.APPLICATION_SUBRIP,
+                                selectionFlags = C.SELECTION_FLAG_DEFAULT,
                             ),
                         ),
                         startPositionMs = 5_000L,
@@ -98,12 +100,94 @@ class VlcFixturePlaybackTest {
             assertTrue(snapshot.tracks.count { it.type == VlcTrackType.TEXT } >= 3)
             val externalTrack = snapshot.tracks.first { it.externalId == EXTERNAL_SUBTITLE_ID }
 
-            instrumentation.runOnMainSync { engine.get().selectSubtitleTrack(externalTrack.id) }
-            assertTrue("MPV did not select the external SRT track", externalSelected.await(5, TimeUnit.SECONDS))
+            assertTrue(
+                "MPV did not automatically select the user-selected external SRT track",
+                externalSelected.await(5, TimeUnit.SECONDS),
+            )
 
             seekRequested.set(true)
             instrumentation.runOnMainSync { engine.get().seekTo(10_000L) }
             assertTrue("MPV did not complete the fast seek", seekPositionReached.await(8, TimeUnit.SECONDS))
+        } finally {
+            instrumentation.runOnMainSync { engine.getAndSet(null)?.close() }
+            externalSubtitle.delete()
+        }
+    }
+
+    @Test
+    fun libMpvAutomaticallySelectsExternalAssForRealMatroska() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val context = instrumentation.targetContext
+        val fixture = File(context.getExternalFilesDir(null), FIXTURE_NAME)
+        assumeTrue("Provision $FIXTURE_NAME in the app external files directory", fixture.isFile)
+        val externalSubtitle = File(context.cacheDir, "vlc-fixture-external.ass").apply {
+            writeText(
+                """
+                [Script Info]
+                ScriptType: v4.00+
+                PlayResX: 640
+                PlayResY: 360
+
+                [V4+ Styles]
+                Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+                Style: Default,sans-serif,48,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,1,2,20,20,24,1
+
+                [Events]
+                Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+                Dialogue: 0,0:00:00.00,0:00:30.00,Default,,0,0,0,,Syncplay external ASS subtitle
+                """.trimIndent(),
+            )
+        }
+
+        val externalSelected = CountDownLatch(1)
+        val latestTracks = AtomicReference(VlcTrackSnapshot())
+        val engine = AtomicReference<LibMpvEngine>()
+        instrumentation.runOnMainSync {
+            engine.set(
+                LibMpvEngine(context).apply {
+                    setListener { event ->
+                        event.tracks?.let { tracks ->
+                            latestTracks.set(tracks)
+                            val externalTrack = tracks.tracks.firstOrNull {
+                                it.externalId == EXTERNAL_ASS_SUBTITLE_ID
+                            }
+                            if (externalTrack != null && tracks.selectedTextId == externalTrack.id) {
+                                externalSelected.countDown()
+                            }
+                        }
+                    }
+                    setMedia(
+                        Uri.fromFile(fixture),
+                        listOf(
+                            VlcExternalSubtitle(
+                                id = EXTERNAL_ASS_SUBTITLE_ID,
+                                uri = Uri.fromFile(externalSubtitle),
+                                label = externalSubtitle.name,
+                                mimeType = MimeTypes.TEXT_SSA,
+                                selectionFlags = C.SELECTION_FLAG_DEFAULT,
+                            ),
+                        ),
+                        startPositionMs = 5_000L,
+                    )
+                    prepare()
+                    play()
+                },
+            )
+        }
+
+        try {
+            assertTrue(
+                "MPV did not automatically select the user-selected external ASS track",
+                externalSelected.await(20, TimeUnit.SECONDS),
+            )
+            val externalTrack = latestTracks.get().tracks.first {
+                it.externalId == EXTERNAL_ASS_SUBTITLE_ID
+            }
+            assertTrue(
+                "MPV did not parse the external file as ASS/SSA",
+                externalTrack.codec.orEmpty().contains("ass", ignoreCase = true) ||
+                    externalTrack.codec.orEmpty().contains("ssa", ignoreCase = true),
+            )
         } finally {
             instrumentation.runOnMainSync { engine.getAndSet(null)?.close() }
             externalSubtitle.delete()
@@ -156,6 +240,7 @@ class VlcFixturePlaybackTest {
     private companion object {
         const val FIXTURE_NAME = "vlc-fixture.mkv"
         const val EXTERNAL_SUBTITLE_ID = "syncplay-external-subtitle:fixture-srt"
+        const val EXTERNAL_ASS_SUBTITLE_ID = "syncplay-external-subtitle:fixture-ass"
         const val RAPID_REPLACEMENT_POSITION_MS = 12_000L
     }
 }

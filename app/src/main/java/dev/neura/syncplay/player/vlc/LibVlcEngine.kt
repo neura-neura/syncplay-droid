@@ -447,6 +447,11 @@ class LibMpvEngine(
             DEFAULT_OPTIONS.forEach { (name, value) ->
                 check(core.setOptionString(name, value) >= 0) { "Unsupported mpv option: $name" }
             }
+            stage("subtitle fonts")
+            ensureSubtitleFont()
+            check(core.setOptionString("config-dir", appContext.filesDir.absolutePath) >= 0) {
+                "Unsupported mpv option: config-dir"
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 ContextCompat.getDisplayOrDefault(appContext).mode.refreshRate
                     .takeIf { it.isFinite() && it > 0f }
@@ -629,13 +634,19 @@ class LibMpvEngine(
         subtitles: List<OpenedMpvSubtitle> = activeSubtitles,
     ) {
         subtitles.forEach { subtitle ->
+            val addMode = mpvSubtitleAddMode(subtitle.metadata.selectionFlags)
             val title = subtitle.metadata.id?.takeIf(String::isNotBlank)
                 ?: subtitle.metadata.label?.takeIf(String::isNotBlank)
                 ?: subtitle.metadata.uri.lastPathSegment.orEmpty()
+            if (addMode == "select") {
+                // `sid` and subtitle visibility are separate MPV properties. A user-selected
+                // sidecar must recover from either an embedded track or a previous "off" choice.
+                core.setPropertyBoolean("sub-visibility", true)
+            }
             core.command(
                 "sub-add",
                 subtitle.source.location,
-                "auto",
+                addMode,
                 title,
                 subtitle.metadata.language.orEmpty(),
             )
@@ -954,6 +965,21 @@ class LibMpvEngine(
         return destination
     }
 
+    /**
+     * The libmpv AAR ships the same broad fallback font used by mpv-android, but a library
+     * consumer must materialize that asset itself. Without it this build has no Android system
+     * font provider: text tracks decode and report a selected `sid`, yet libass renders no glyphs.
+     */
+    private fun ensureSubtitleFont(): File {
+        val destination = File(appContext.filesDir, "subfont.ttf")
+        if (!destination.isFile || destination.length() == 0L) {
+            appContext.assets.open("subfont.ttf").use { source ->
+                destination.outputStream().buffered().use { target -> source.copyTo(target) }
+            }
+        }
+        return destination
+    }
+
     private fun secondsToMs(value: Double): Long = (value * 1_000.0).toLong().coerceAtLeast(0L)
     private fun seconds(valueMs: Long): Double = valueMs / 1_000.0
 
@@ -966,7 +992,9 @@ class LibMpvEngine(
          * `mediacodec_embed` is intentionally absent because it cannot render ASS/PGS/OSD.
          */
         val DEFAULT_OPTIONS: Map<String, String> = linkedMapOf(
-            "config" to "no",
+            // The AAR's fallback `subfont.ttf` is resolved through this private config directory.
+            // No user-supplied config is exposed; the directory belongs exclusively to the app.
+            "config" to "yes",
             "profile" to "fast",
             "vo" to VIDEO_OUTPUT,
             "gpu-context" to "android",
@@ -1235,6 +1263,10 @@ internal fun fdMrlForDescriptor(fd: Int): String {
     require(fd >= 0) { "File descriptor must be non-negative" }
     return "fd://$fd"
 }
+
+/** Translate Media3's default sidecar intent to MPV's explicit add/select semantics. */
+internal fun mpvSubtitleAddMode(selectionFlags: Int): String =
+    if (selectionFlags and C.SELECTION_FLAG_DEFAULT != 0) "select" else "auto"
 
 internal fun externalTrackMatches(
     subtitle: VlcExternalSubtitle,

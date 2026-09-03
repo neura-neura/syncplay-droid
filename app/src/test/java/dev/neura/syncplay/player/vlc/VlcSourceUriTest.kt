@@ -1,5 +1,6 @@
 package dev.neura.syncplay.player.vlc
 
+import androidx.media3.common.C
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -17,6 +18,16 @@ class VlcSourceUriTest {
     fun descriptorMrlContainsOnlyTheDescriptorNumber() {
         assertEquals("fd://17", fdMrlForDescriptor(17))
         assertThrows { fdMrlForDescriptor(-1) }
+    }
+
+    @Test
+    fun userSelectedExternalSubtitleUsesMpvSelectMode() {
+        assertEquals("select", mpvSubtitleAddMode(C.SELECTION_FLAG_DEFAULT))
+        assertEquals(
+            "select",
+            mpvSubtitleAddMode(C.SELECTION_FLAG_DEFAULT or C.SELECTION_FLAG_FORCED),
+        )
+        assertEquals("auto", mpvSubtitleAddMode(0))
     }
 
     private fun assertThrows(block: () -> Unit) {
