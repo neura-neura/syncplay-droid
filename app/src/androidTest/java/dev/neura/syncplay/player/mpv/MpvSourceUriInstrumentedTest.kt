@@ -1,4 +1,4 @@
-package dev.neura.syncplay.player.vlc
+package dev.neura.syncplay.player.mpv
 
 import android.net.Uri
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -8,10 +8,10 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
-class VlcSourceUriInstrumentedTest {
+class MpvSourceUriInstrumentedTest {
     @Test
     fun subtitleNamesMatchLabelsAndDecodedFileNames() {
-        val subtitle = VlcExternalSubtitle(
+        val subtitle = MpvExternalSubtitle(
             id = "sub-1",
             uri = Uri.parse("content://provider/Sub%20Title.srt"),
             label = "Spanish",

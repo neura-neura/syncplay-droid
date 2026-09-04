@@ -1,8 +1,6 @@
-package dev.neura.syncplay.player.vlc
+package dev.neura.syncplay.player.mpv
 
 import android.net.Uri
-import androidx.media3.common.C
-import androidx.media3.common.MimeTypes
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
@@ -18,14 +16,14 @@ import org.junit.runner.RunWith
 
 /** Optional device fixture test; skipped when the Matroska fixture was not provisioned externally. */
 @RunWith(AndroidJUnit4::class)
-class VlcFixturePlaybackTest {
+class MpvFixturePlaybackTest {
     @Test
     fun libMpvParsesPlaysSeeksAndSelectsExternalSubtitleForRealMatroska() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
         val fixture = File(context.getExternalFilesDir(null), FIXTURE_NAME)
         assumeTrue("Provision $FIXTURE_NAME in the app external files directory", fixture.isFile)
-        val externalSubtitle = File(context.cacheDir, "vlc-fixture-external.srt").apply {
+        val externalSubtitle = File(context.cacheDir, "mpv-fixture-external.srt").apply {
             writeText("1\n00:00:00,000 --> 00:00:30,000\nSyncplay external subtitle\n")
         }
 
@@ -35,7 +33,7 @@ class VlcFixturePlaybackTest {
         val seekPositionReached = CountDownLatch(1)
         val seekRequested = AtomicBoolean(false)
         val externalSelected = CountDownLatch(1)
-        val latestTracks = AtomicReference(VlcTrackSnapshot())
+        val latestTracks = AtomicReference(MpvTrackSnapshot())
         val engine = AtomicReference<LibMpvEngine>()
         instrumentation.runOnMainSync {
             engine.set(
@@ -46,19 +44,19 @@ class VlcFixturePlaybackTest {
                             val externalTrack = tracks.tracks.firstOrNull {
                                 it.externalId == EXTERNAL_SUBTITLE_ID
                             }
-                            if (externalTrack != null && tracks.selectedTextId == externalTrack.id) {
+                            if (externalTrack != null && tracks.selectedSubtitleId == externalTrack.id) {
                                 externalSelected.countDown()
                             }
-                            if (tracks.tracks.any { it.type == VlcTrackType.VIDEO } &&
-                                tracks.tracks.any { it.type == VlcTrackType.AUDIO } &&
-                                tracks.tracks.count { it.type == VlcTrackType.TEXT } >= 3 &&
+                            if (tracks.tracks.any { it.type == MpvTrackType.VIDEO } &&
+                                tracks.tracks.any { it.type == MpvTrackType.AUDIO } &&
+                                tracks.tracks.count { it.type == MpvTrackType.SUBTITLE } >= 3 &&
                                 externalTrack != null
                             ) {
                                 parsed.countDown()
                             }
                         }
-                        if (event.kind == VlcEngineEvent.Kind.PLAYING) playing.countDown()
-                        if (event.kind == VlcEngineEvent.Kind.TIME_CHANGED) {
+                        if (event.kind == MpvEngineEvent.Kind.PLAYING) playing.countDown()
+                        if (event.kind == MpvEngineEvent.Kind.TIME_CHANGED) {
                             val position = event.positionMs ?: 0L
                             if (!seekRequested.get() && position >= 4_750L) {
                                 initialPositionReached.countDown()
@@ -71,12 +69,12 @@ class VlcFixturePlaybackTest {
                     setMedia(
                         Uri.fromFile(fixture),
                         listOf(
-                            VlcExternalSubtitle(
+                            MpvExternalSubtitle(
                                 id = EXTERNAL_SUBTITLE_ID,
                                 uri = Uri.fromFile(externalSubtitle),
                                 label = externalSubtitle.name,
-                                mimeType = MimeTypes.APPLICATION_SUBRIP,
-                                selectionFlags = C.SELECTION_FLAG_DEFAULT,
+                                mimeType = "application/x-subrip",
+                                isDefault = true,
                             ),
                         ),
                         startPositionMs = 5_000L,
@@ -95,9 +93,9 @@ class VlcFixturePlaybackTest {
                 initialPositionReached.await(8, TimeUnit.SECONDS),
             )
             val snapshot = latestTracks.get()
-            assertTrue(snapshot.tracks.any { it.type == VlcTrackType.VIDEO })
-            assertTrue(snapshot.tracks.any { it.type == VlcTrackType.AUDIO })
-            assertTrue(snapshot.tracks.count { it.type == VlcTrackType.TEXT } >= 3)
+            assertTrue(snapshot.tracks.any { it.type == MpvTrackType.VIDEO })
+            assertTrue(snapshot.tracks.any { it.type == MpvTrackType.AUDIO })
+            assertTrue(snapshot.tracks.count { it.type == MpvTrackType.SUBTITLE } >= 3)
             val externalTrack = snapshot.tracks.first { it.externalId == EXTERNAL_SUBTITLE_ID }
 
             assertTrue(
@@ -120,7 +118,7 @@ class VlcFixturePlaybackTest {
         val context = instrumentation.targetContext
         val fixture = File(context.getExternalFilesDir(null), FIXTURE_NAME)
         assumeTrue("Provision $FIXTURE_NAME in the app external files directory", fixture.isFile)
-        val externalSubtitle = File(context.cacheDir, "vlc-fixture-external.ass").apply {
+        val externalSubtitle = File(context.cacheDir, "mpv-fixture-external.ass").apply {
             writeText(
                 """
                 [Script Info]
@@ -140,7 +138,7 @@ class VlcFixturePlaybackTest {
         }
 
         val externalSelected = CountDownLatch(1)
-        val latestTracks = AtomicReference(VlcTrackSnapshot())
+        val latestTracks = AtomicReference(MpvTrackSnapshot())
         val engine = AtomicReference<LibMpvEngine>()
         instrumentation.runOnMainSync {
             engine.set(
@@ -151,7 +149,7 @@ class VlcFixturePlaybackTest {
                             val externalTrack = tracks.tracks.firstOrNull {
                                 it.externalId == EXTERNAL_ASS_SUBTITLE_ID
                             }
-                            if (externalTrack != null && tracks.selectedTextId == externalTrack.id) {
+                            if (externalTrack != null && tracks.selectedSubtitleId == externalTrack.id) {
                                 externalSelected.countDown()
                             }
                         }
@@ -159,12 +157,12 @@ class VlcFixturePlaybackTest {
                     setMedia(
                         Uri.fromFile(fixture),
                         listOf(
-                            VlcExternalSubtitle(
+                            MpvExternalSubtitle(
                                 id = EXTERNAL_ASS_SUBTITLE_ID,
                                 uri = Uri.fromFile(externalSubtitle),
                                 label = externalSubtitle.name,
-                                mimeType = MimeTypes.TEXT_SSA,
-                                selectionFlags = C.SELECTION_FLAG_DEFAULT,
+                                mimeType = "text/x-ssa",
+                                isDefault = true,
                             ),
                         ),
                         startPositionMs = 5_000L,
@@ -208,9 +206,9 @@ class VlcFixturePlaybackTest {
             engine.set(
                 LibMpvEngine(context).apply {
                     setListener { event ->
-                        if (event.kind == VlcEngineEvent.Kind.STOPPED) stoppedEvents.incrementAndGet()
+                        if (event.kind == MpvEngineEvent.Kind.STOPPED) stoppedEvents.incrementAndGet()
                         if (
-                            event.kind == VlcEngineEvent.Kind.TIME_CHANGED &&
+                            event.kind == MpvEngineEvent.Kind.TIME_CHANGED &&
                             (event.positionMs ?: 0L) >= RAPID_REPLACEMENT_POSITION_MS - 250L
                         ) {
                             newestPositionReached.countDown()
@@ -238,7 +236,7 @@ class VlcFixturePlaybackTest {
     }
 
     private companion object {
-        const val FIXTURE_NAME = "vlc-fixture.mkv"
+        const val FIXTURE_NAME = "mpv-fixture.mkv"
         const val EXTERNAL_SUBTITLE_ID = "syncplay-external-subtitle:fixture-srt"
         const val EXTERNAL_ASS_SUBTITLE_ID = "syncplay-external-subtitle:fixture-ass"
         const val RAPID_REPLACEMENT_POSITION_MS = 12_000L

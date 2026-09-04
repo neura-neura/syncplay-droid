@@ -2,19 +2,19 @@
   <img src="docs/logo.svg" width="180" alt="Syncplay Droid logo">
 </p>
 
-# Syncplay Droid
+# Syncplay Droid 0.4.0
 
 Syncplay Droid is a native Android client for watching videos in sync with people using
 [Syncplay](https://syncplay.pl/) on Windows, macOS, or Linux. It is written in Kotlin with Jetpack
-Compose, Material 3 Expressive, and [AndroidX Media3](https://github.com/androidx/media) as its
-playback/session foundation. A libmpv compatibility backend is available for demanding Matroska,
-HEVC Main10, multichannel-audio, and device-decoder cases.
+Compose and Material 3 Expressive. Version 0.4.0 is MPV-only: the bundled libmpv engine handles
+all media playback, while AndroidX libraries provide the user interface and Android platform
+integration.
 
-The app speaks the standard Syncplay TCP/JSON protocol directly. Desktop participants can keep
-using mpv, VLC, MPC-HC, MPC-BE, Noir Player, or another supported player integration: every client
-controls its own player while the Syncplay server coordinates play, pause, and position.
+The app speaks the standard Syncplay TCP/JSON protocol directly. Other Syncplay clients can keep
+using their own players: each client controls its local playback while the Syncplay server
+coordinates play, pause, and position.
 
-[Download Syncplay Droid 0.3.4](https://github.com/neura-neura/syncplay-droid/releases/tag/v0.3.4)
+[Download Syncplay Droid 0.4.0](https://github.com/neura-neura/syncplay-droid/releases/tag/v0.4.0)
 
 ## Features
 
@@ -23,24 +23,33 @@ controls its own player while the Syncplay server coordinates play, pause, and p
   explicit compatibility option for older servers.
 - Remember the server password using an AES-GCM key stored in Android Keystore. The secret is
   excluded from Android backup and device transfer.
-- Play local files and HTTP(S) URLs through Media3, including supported HLS and DASH streams.
-- Automatically route seekable Matroska files to a libmpv-backed Media3 `Player` compatibility
-  mode, or choose Media3/MPV manually without disconnecting the media controller.
-- Browse SMB2/SMB3 shares directly inside the app. Positional reads, a 2 MiB read-ahead window,
-  reconnect-once handling, and bounded playback buffers make large remote MKVs seekable without
+- Play local files, Android document-provider files, direct SMB2/SMB3 sources, and HTTP(S) URLs
+  through MPV.
+- Keep playback running in the background with fullscreen landscape playback, immersive mode, an
+  Android media notification, and system media controls.
+- Browse SMB2/SMB3 shares directly inside the app. MPV uses a bounded loopback range bridge with
+  positional reads and reconnect-once handling, so large remote MKVs remain seekable without
   depending on a file manager's sequential `content://` pipe.
 - Choose the file manager used to open videos and subtitles. MiX Explorer and other Storage Access
   Framework providers can return files from SMB locations without exposing SMB credentials to this
   app.
-- List embedded subtitle tracks exposed by the active player, including PGS tracks in Matroska. The
-  subtitle picker can switch between embedded tracks, disable subtitles, or open an external file.
-- Load external SRT, ASS/SSA, WebVTT, and TTML subtitles. SAF/SMB sidecars are handed to libmpv
-  through short-lived extension-preserving cache files. The selected sidecar is explicitly
-  preferred over an embedded default track, and a bundled Unicode fallback font keeps text
-  subtitles renderable on Android builds without a system font provider. Selecting another
-  sidecar replaces it, and changing videos clears it.
-- Use Media3 playback controls, fullscreen landscape playback, immersive mode, background playback,
-  a media notification, and Android system media controls.
+- Select internal subtitle tracks exposed by MPV, including text and bitmap tracks when the media
+  provides them. The subtitle picker can switch tracks, disable subtitles, or open an external
+  sidecar.
+- Open external SRT, VTT, ASS, SSA, TTML, SUP/PGS, and Noir-compatible ZIP subtitles from a
+  document provider or SMB. A selected sidecar replaces the previous external sidecar, and
+  changing videos clears it.
+- Customize subtitle appearance for text captions: font size, text and background colors,
+  background opacity, position, maximum width, padding, weight, line height, letter spacing,
+  corner radius, and text shadow. Appearance and timing preferences are stored locally.
+- Start with Noir Player's GothamPro CSS font stack (downloaded and cached from its public CDN,
+  with Android sans-serif as the offline fallback), choose local Android font families, or load
+  TTF/OTF faces declared by another HTTP(S) CSS `@font-face` stylesheet.
+- Set a subtitle offset from -120 to +120 seconds, optionally remember it, and use previous/next
+  cue alignment for the selected text track.
+- Export an offset-adjusted copy of the selected external text subtitle, including the first
+  supported track in a ZIP. VTT stays VTT; SRT, ASS, and SSA are written as SRT. Internal and
+  bitmap tracks are not exportable.
 - Synchronize play, pause, and seek in both directions, with speed-based drift correction for small
   offsets and a direct seek for larger offsets.
 - Use room chat, readiness, participant/file status, and shared playlist views when the server
@@ -60,7 +69,7 @@ same path is available through an Android document provider.
 
 ## Quick start
 
-1. Install the APK from the [v0.3.4 release](https://github.com/neura-neura/syncplay-droid/releases/tag/v0.3.4).
+1. Install the APK from the [v0.4.0 release](https://github.com/neura-neura/syncplay-droid/releases/tag/v0.4.0).
 2. Enter the same server and exact room name as the desktop participants.
 3. Join the room and open your local copy, an HTTP(S) URL, or **SMB direct**.
 4. Open the **Room** tab and confirm that the file name, duration, and size match.
@@ -92,24 +101,20 @@ Instrumented tests require a connected device or emulator:
 
 ## Compatibility and security notes
 
-- Available containers, codecs, and subtitle rendering behavior depend on Android and device
-  capabilities. Automatic mode keeps AndroidX Media3 as the session foundation and chooses libmpv
-  for Matroska compatibility; the room menu provides a manual override.
-- MPV uses its GPU video output with MediaCodec first and software fallback where the device
-  rejects HEVC Main10. Its direct MediaCodec output is deliberately not used because that path
-  cannot render embedded PGS or ASS/SRT subtitles.
-- Plain `http://` media URLs are supported for local and legacy servers, but their traffic is not
-  encrypted. Prefer `https://` whenever possible.
+- Available containers, codecs, and subtitle rendering behavior depend on the bundled MPV build,
+  Android, and the device. Bitmap subtitle rendering remains native to MPV; text captions use the
+  MPV subtitle pipeline and the app's appearance controls.
+- Plain `http://` media and CSS URLs are accepted for local or legacy servers, but their traffic is
+  not encrypted. Prefer `https://` whenever possible.
 - Document providers may grant persistent or temporary access. When only temporary access is
   available, the playback service retains it for the active playback session.
 - External file managers can still return SMB files as `content://` URIs. If their provider exposes
   only a sequential pipe, the app warns that seeking is unreliable and offers **SMB direct**.
 - Direct SMB credentials live only in process memory and are never written to the generated URI,
   logs, saved state, or preferences.
-- The built-in **SMB direct** browser remains on the positional Media3/SMBJ source. Selecting the
-  same SMB file through Solid Explorer or another seekable document provider enables the MPV path.
-- The downloadable 0.3.4 APK is debug-signed and debuggable for direct testing. It is not a
-  production-signed or Google Play build.
+- The built-in **SMB direct** browser connects MPV to a positional SMB source. Selecting the same
+  SMB file through Solid Explorer or another seekable document provider also keeps the MPV path.
+- A locally built debug APK is debuggable and is not a production-signed or Google Play build.
 
 ## Acknowledgements and license
 
@@ -117,6 +122,6 @@ Protocol behavior was implemented from the compatible behavior of
 [syncplay-noir](https://github.com/neura-neura/syncplay-noir) and
 [Syncplay](https://github.com/Syncplay/syncplay).
 
-Syncplay Droid 0.3.3 and later are distributed under the [GNU GPL v3 or later](LICENSE).
-Attribution, native component licenses, and corresponding-source locations are documented in
+Syncplay Droid 0.4.0 is distributed under the [GNU GPL v3 or later](LICENSE). Attribution, native
+component licenses, and corresponding-source locations are documented in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

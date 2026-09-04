@@ -1,4 +1,4 @@
-Syncplay Droid
+Syncplay Droid 0.4.0
 
 This product implements protocol behavior derived from and compatible with Syncplay and the
 syncplay-noir fork, both distributed under the Apache License, Version 2.0.
@@ -9,8 +9,9 @@ Syncplay authors and contributors:
 - Original SyncPlay code: Tomasz Kowalczyk (Fluxid)
 - Other Syncplay contributors
 
-This product uses AndroidX Media3 and other AndroidX components, Gson, Kotlin, and kotlinx
-coroutines. It also uses SMBJ (com.hierynomus:smbj), licensed under the Apache License,
-Version 2.0, and mpv-android-lib (io.github.abdallahmehiz:mpv-android-lib), whose Kotlin/JNI
-wrapper is MIT-licensed and whose bundled mpv/FFmpeg build is GPL software. Their respective
-licenses and notices remain applicable. See THIRD_PARTY_NOTICES.md.
+This product uses AndroidX libraries for its user interface and Android platform integration,
+Gson, Kotlin, and kotlinx.coroutines. It also uses SMBJ (com.hierynomus:smbj), licensed under the
+Apache License, Version 2.0, and mpv-android-lib (io.github.abdallahmehiz:mpv-android-lib) as its
+sole media playback engine. The mpv-android-lib Kotlin/JNI wrapper is MIT-licensed; its bundled
+mpv, FFmpeg, libass, and related native components remain under their respective upstream
+licenses, including GPL-licensed components. See THIRD_PARTY_NOTICES.md.

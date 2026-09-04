@@ -1,81 +1,52 @@
 package dev.neura.syncplay.player
 
 import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.Build
-import androidx.media3.session.MediaController
-import androidx.media3.session.SessionToken
+import android.os.IBinder
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
-import org.junit.Test
 import org.junit.runner.RunWith
+import org.junit.Test
 
 @RunWith(AndroidJUnit4::class)
 class PlaybackServiceConnectionTest {
     @Test
-    fun ownApplicationCanConnectToTheProtectedMediaSessionService() {
-        val instrumentation = InstrumentationRegistry.getInstrumentation()
-        val context = instrumentation.targetContext
-        val component = ComponentName(context, PlaybackService::class.java)
-        val token = SessionToken(context, component)
-        val future = MediaController.Builder(context, token).buildAsync()
+    fun ownApplicationCanBindToTheMpvPlaybackService() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val connected = CountDownLatch(1)
+        var serviceBinder: PlaybackService.LocalBinder? = null
+        val connection = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+                serviceBinder = binder as? PlaybackService.LocalBinder
+                connected.countDown()
+            }
 
-        val controller = future.get(10, TimeUnit.SECONDS)
+            override fun onServiceDisconnected(name: ComponentName?) = Unit
+        }
+        val intent = Intent(context, PlaybackService::class.java)
+
+        assertTrue(context.bindService(intent, connection, Context.BIND_AUTO_CREATE))
         try {
-            assertTrue(controller.isConnected)
+            assertTrue(connected.await(10, TimeUnit.SECONDS))
+            val session = requireNotNull(serviceBinder?.playbackSession)
+            assertTrue(PlaybackService.currentSession() === session)
+            assertFalse(session.hasMedia())
         } finally {
-            instrumentation.runOnMainSync(controller::release)
+            context.unbindService(connection)
         }
     }
 
     @Test
-    fun mediaSessionCanSwitchToVlcAndBackWithoutDisconnectingController() {
-        val instrumentation = InstrumentationRegistry.getInstrumentation()
-        val context = instrumentation.targetContext
-        val token = SessionToken(context, ComponentName(context, PlaybackService::class.java))
-        val future = MediaController.Builder(context, token).buildAsync()
-        val controller = future.get(10, TimeUnit.SECONDS)
-
-        try {
-            instrumentation.runOnMainSync {
-                assertTrue(
-                    PlaybackService.setPlaybackEngineNow(
-                        PlaybackEngine.MPV,
-                        PlaybackEngineReason.USER_SELECTION,
-                    ),
-                )
-            }
-            instrumentation.waitForIdleSync()
-            assertTrue(controller.isConnected)
-            assertEquals(PlaybackEngine.MPV, PlaybackEngineStore.state.value.active)
-
-            instrumentation.runOnMainSync {
-                assertTrue(
-                    PlaybackService.setPlaybackEngineNow(
-                        PlaybackEngine.MEDIA3,
-                        PlaybackEngineReason.USER_SELECTION,
-                    ),
-                )
-            }
-            instrumentation.waitForIdleSync()
-            assertTrue(controller.isConnected)
-            assertEquals(PlaybackEngine.MEDIA3, PlaybackEngineStore.state.value.active)
-        } finally {
-            instrumentation.runOnMainSync {
-                PlaybackService.setPlaybackEngineNow(
-                    PlaybackEngine.MEDIA3,
-                    PlaybackEngineReason.USER_SELECTION,
-                )
-                controller.release()
-            }
-        }
-    }
-
-    @Test
-    fun exportedServiceRequiresThePrivilegedSystemMediaPermission() {
+    fun serviceManifestIsNotExportedToOtherApplications() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val component = ComponentName(context, PlaybackService::class.java)
         @Suppress("DEPRECATION")
@@ -85,7 +56,7 @@ class PlaybackServiceConnectionTest {
             context.packageManager.getServiceInfo(component, 0)
         }
 
-        assertTrue(serviceInfo.exported)
-        assertEquals("android.permission.MEDIA_CONTENT_CONTROL", serviceInfo.permission)
+        assertFalse(serviceInfo.exported)
+        assertEquals(null, serviceInfo.permission)
     }
 }

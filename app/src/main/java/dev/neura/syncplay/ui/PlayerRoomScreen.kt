@@ -4,7 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
-import android.graphics.Color as AndroidColor
+import android.view.SurfaceView
 import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
@@ -49,6 +49,12 @@ import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ClosedCaption
 import androidx.compose.material.icons.rounded.BugReport
+import androidx.compose.material.icons.rounded.Fullscreen
+import androidx.compose.material.icons.rounded.FullscreenExit
+import androidx.compose.material.icons.rounded.Pause
+import androidx.compose.material.icons.rounded.Replay5
+import androidx.compose.material.icons.rounded.Forward10
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Groups
 import androidx.compose.material.icons.rounded.HourglassEmpty
 import androidx.compose.material.icons.rounded.Key
@@ -86,6 +92,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Slider
 import androidx.compose.material3.PlainTooltip
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -130,10 +137,6 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.ViewCompat
-import androidx.media3.common.Player
-import androidx.media3.common.util.UnstableApi
-import androidx.media3.ui.AspectRatioFrameLayout
-import androidx.media3.ui.PlayerView
 import dev.neura.syncplay.R
 import dev.neura.syncplay.protocol.ChatEntry
 import dev.neura.syncplay.protocol.ConnectionStatus
@@ -141,12 +144,13 @@ import dev.neura.syncplay.protocol.RoomUser
 import dev.neura.syncplay.protocol.supportsSyncplayFeature
 import dev.neura.syncplay.player.AudioFormatDiagnostics
 import dev.neura.syncplay.player.PlaybackDiagnostics
-import dev.neura.syncplay.player.PlaybackEngine
-import dev.neura.syncplay.player.PlaybackEnginePreference
-import dev.neura.syncplay.player.PlaybackEngineReason
-import dev.neura.syncplay.player.PlaybackEngineState
 import dev.neura.syncplay.player.VideoFormatDiagnostics
 import dev.neura.syncplay.player.SourceAccessClassification
+import dev.neura.syncplay.ui.subtitle.SubtitleCustomizationDialog
+import dev.neura.syncplay.ui.subtitle.SubtitleTextOverlay
+import dev.neura.syncplay.ui.subtitle.SubtitleAppearance
+import dev.neura.syncplay.ui.subtitle.SubtitleExport
+import dev.neura.syncplay.ui.subtitle.SubtitleSyncSettings
 import java.util.Locale
 import kotlin.math.abs
 
@@ -165,17 +169,28 @@ fun PlayerRoomScreen(
     onChangeRoom: (String) -> Unit,
     onDisconnect: () -> Unit,
     onDismissPlaybackError: () -> Unit,
-    onSetPlaybackEngine: (PlaybackEnginePreference) -> Unit = {},
+    onTogglePlayback: () -> Unit = {},
+    onSeekTo: (Long) -> Unit = {},
+    onSeekBy: (Long) -> Unit = {},
+    onAttachVideoOutput: (Any?) -> Unit = {},
+    onClearVideoOutput: (Any?) -> Unit = {},
+    onSubtitleAppearanceChange: (SubtitleAppearance) -> Unit = {},
+    onSubtitleSyncChange: (SubtitleSyncSettings) -> Unit = {},
+    onAlignSubtitleCue: (Int) -> Unit = {},
+    onExportSubtitle: (String) -> Unit = {},
+    onRemoteFontCssUrlChange: (String) -> Unit = {},
+    onLoadRemoteFontCss: (String) -> Unit = {},
+    onResetSubtitleAppearance: () -> Unit = {},
 ) {
     var panel by rememberSaveable { mutableStateOf(RoomPanel.PEOPLE) }
     var showUrlDialog by rememberSaveable { mutableStateOf(false) }
     var showRoomDialog by rememberSaveable { mutableStateOf(false) }
     var showSubtitleDialog by rememberSaveable { mutableStateOf(false) }
     var showDiagnosticsDialog by rememberSaveable { mutableStateOf(false) }
-    var showEngineDialog by rememberSaveable { mutableStateOf(false) }
+    var showSubtitleCustomization by rememberSaveable { mutableStateOf(false) }
     var isFullscreen by rememberSaveable { mutableStateOf(false) }
     val openSubtitleSelector = { showSubtitleDialog = true }
-    val fullscreenActive = isFullscreen && state.player != null && state.media != null
+    val fullscreenActive = isFullscreen && state.playerAvailable && state.media != null
     val roomUsers = state.users.filter { it.room == state.effectiveRoom }
     val companionCount = roomUsers.count { it.username != state.effectiveUsername }
     val companionSummary = when (companionCount) {
@@ -183,21 +198,30 @@ fun PlayerRoomScreen(
         1 -> "1 compañero"
         else -> "$companionCount compañeros"
     }
+    val selectedSubtitleTrack = state.subtitleTracks.firstOrNull { it.isSelected }
+    val subtitleExportName = selectedSubtitleTrack
+        ?.takeIf { it.isExternal && it.isText && SubtitleExport.supports(it.label) }
+        ?.let { SubtitleExport.suggestedFileName(it.label) }
 
-    LaunchedEffect(state.player, state.media) {
-        if (state.player == null || state.media == null) isFullscreen = false
+    LaunchedEffect(state.playerAvailable, state.media) {
+        if (!state.playerAvailable || state.media == null) isFullscreen = false
     }
     FullscreenWindowEffect(fullscreenActive)
     BackHandler(enabled = fullscreenActive) { isFullscreen = false }
 
     if (fullscreenActive) {
         FullscreenPlayerScreen(
-            player = state.player,
-            playbackEngine = state.playbackEngine.active,
+            state = state,
             isMediaLoading = state.isMediaLoading,
             isSubtitleLoading = state.isSubtitleLoading,
             onFullscreenChange = { isFullscreen = it },
             onSubtitle = openSubtitleSelector,
+            onSubtitleCustomization = { showSubtitleCustomization = true },
+            onTogglePlayback = onTogglePlayback,
+            onSeekTo = onSeekTo,
+            onSeekBy = onSeekBy,
+            onAttachVideoOutput = onAttachVideoOutput,
+            onClearVideoOutput = onClearVideoOutput,
         )
         if (showSubtitleDialog) {
             SubtitleSelectorDialog(
@@ -218,6 +242,28 @@ fun PlayerRoomScreen(
                 onDismiss = { showSubtitleDialog = false },
             )
         }
+        if (showSubtitleCustomization) {
+            SubtitleCustomizationDialog(
+                appearance = state.subtitlePreferences.appearance,
+                sync = state.subtitlePreferences.sync,
+                onAppearanceChange = onSubtitleAppearanceChange,
+                onSyncChange = onSubtitleSyncChange,
+                canAlignToCue = state.subtitleTracks.any { it.isSelected && it.isText },
+                onAlignPreviousCue = { onAlignSubtitleCue(-1) },
+                onAlignNextCue = { onAlignSubtitleCue(1) },
+                canExportSubtitle = subtitleExportName != null,
+                isExportingSubtitle = state.isSubtitleExporting,
+                onExportSubtitle = { subtitleExportName?.let(onExportSubtitle) },
+                onDismiss = { showSubtitleCustomization = false },
+                installedFonts = state.installedSubtitleFonts,
+                remoteFonts = state.remoteSubtitleFonts,
+                remoteCssUrl = state.remoteFontCssUrl,
+                isRemoteFontLoading = state.isRemoteFontLoading,
+                onRemoteCssUrlChange = onRemoteFontCssUrlChange,
+                onLoadRemoteCss = onLoadRemoteFontCss,
+                onResetAppearance = onResetSubtitleAppearance,
+            )
+        }
         return
     }
 
@@ -235,7 +281,7 @@ fun PlayerRoomScreen(
                     onChangeRoom = { showRoomDialog = true },
                     onDisconnect = onDisconnect,
                     onShowDiagnostics = { showDiagnosticsDialog = true },
-                    onShowPlaybackEngine = { showEngineDialog = true },
+                    onShowSubtitleCustomization = { showSubtitleCustomization = true },
                 )
             },
             bottomBar = {
@@ -279,7 +325,13 @@ fun PlayerRoomScreen(
                                 onOpenUrl = { showUrlDialog = true },
                                 onOpenSmb = onOpenSmbMedia,
                                 onOpenSubtitleSelector = openSubtitleSelector,
+                                onSubtitleCustomization = { showSubtitleCustomization = true },
                                 onFullscreenChange = { isFullscreen = it },
+                                onTogglePlayback = onTogglePlayback,
+                                onSeekTo = onSeekTo,
+                                onSeekBy = onSeekBy,
+                                onAttachVideoOutput = onAttachVideoOutput,
+                                onClearVideoOutput = onClearVideoOutput,
                                 modifier = Modifier
                                     .weight(1f)
                                     .fillMaxWidth(),
@@ -324,7 +376,13 @@ fun PlayerRoomScreen(
                                 onOpenUrl = { showUrlDialog = true },
                                 onOpenSmb = onOpenSmbMedia,
                                 onOpenSubtitleSelector = openSubtitleSelector,
+                                onSubtitleCustomization = { showSubtitleCustomization = true },
                                 onFullscreenChange = { isFullscreen = it },
+                                onTogglePlayback = onTogglePlayback,
+                                onSeekTo = onSeekTo,
+                                onSeekBy = onSeekBy,
+                                onAttachVideoOutput = onAttachVideoOutput,
+                                onClearVideoOutput = onClearVideoOutput,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .heightIn(min = 310.dp)
@@ -337,7 +395,13 @@ fun PlayerRoomScreen(
                                 onOpenUrl = { showUrlDialog = true },
                                 onOpenSmb = onOpenSmbMedia,
                                 onOpenSubtitleSelector = openSubtitleSelector,
+                                onSubtitleCustomization = { showSubtitleCustomization = true },
                                 onFullscreenChange = { isFullscreen = it },
+                                onTogglePlayback = onTogglePlayback,
+                                onSeekTo = onSeekTo,
+                                onSeekBy = onSeekBy,
+                                onAttachVideoOutput = onAttachVideoOutput,
+                                onClearVideoOutput = onClearVideoOutput,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .aspectRatio(16f / 9f)
@@ -424,18 +488,29 @@ fun PlayerRoomScreen(
     if (showDiagnosticsDialog) {
         PlaybackDiagnosticsDialog(
             diagnostics = state.playbackDiagnostics,
-            engine = state.playbackEngine,
             onDismiss = { showDiagnosticsDialog = false },
         )
     }
-    if (showEngineDialog) {
-        PlaybackEngineDialog(
-            state = state.playbackEngine,
-            onSelect = { preference ->
-                showEngineDialog = false
-                onSetPlaybackEngine(preference)
-            },
-            onDismiss = { showEngineDialog = false },
+    if (showSubtitleCustomization) {
+        SubtitleCustomizationDialog(
+            appearance = state.subtitlePreferences.appearance,
+            sync = state.subtitlePreferences.sync,
+            onAppearanceChange = onSubtitleAppearanceChange,
+            onSyncChange = onSubtitleSyncChange,
+            canAlignToCue = state.subtitleTracks.any { it.isSelected && it.isText },
+            onAlignPreviousCue = { onAlignSubtitleCue(-1) },
+            onAlignNextCue = { onAlignSubtitleCue(1) },
+            canExportSubtitle = subtitleExportName != null,
+            isExportingSubtitle = state.isSubtitleExporting,
+            onExportSubtitle = { subtitleExportName?.let(onExportSubtitle) },
+            onDismiss = { showSubtitleCustomization = false },
+            installedFonts = state.installedSubtitleFonts,
+            remoteFonts = state.remoteSubtitleFonts,
+            remoteCssUrl = state.remoteFontCssUrl,
+            isRemoteFontLoading = state.isRemoteFontLoading,
+            onRemoteCssUrlChange = onRemoteFontCssUrlChange,
+            onLoadRemoteCss = onLoadRemoteFontCss,
+            onResetAppearance = onResetSubtitleAppearance,
         )
     }
 }
@@ -590,7 +665,6 @@ private fun SubtitleTrackOption(
 @Composable
 private fun PlaybackDiagnosticsDialog(
     diagnostics: PlaybackDiagnostics,
-    engine: PlaybackEngineState,
     onDismiss: () -> Unit,
 ) {
     val maxListHeight = (LocalConfiguration.current.screenHeightDp * 0.58f)
@@ -618,7 +692,7 @@ private fun PlaybackDiagnosticsDialog(
                     )
                 }
                 item { DiagnosticRow("Origen", source) }
-                item { DiagnosticRow("Motor", playbackEngineSummary(engine)) }
+                item { DiagnosticRow("Motor", "MPV · único motor de reproducción") }
                 item {
                     DiagnosticRow(
                         "Dispositivo",
@@ -626,7 +700,7 @@ private fun PlaybackDiagnosticsDialog(
                             "(API ${Build.VERSION.SDK_INT})",
                     )
                 }
-                item { DiagnosticRow("Interpretación", diagnosticsAssessment(diagnostics, engine)) }
+                item { DiagnosticRow("Interpretación", diagnosticsAssessment(diagnostics)) }
                 item {
                     DiagnosticRow(
                         "Decodificador de video",
@@ -720,91 +794,6 @@ private fun PlaybackDiagnosticsDialog(
 }
 
 @Composable
-private fun PlaybackEngineDialog(
-    state: PlaybackEngineState,
-    onSelect: (PlaybackEnginePreference) -> Unit,
-    onDismiss: () -> Unit,
-) {
-    val options = listOf(
-        Triple(
-            PlaybackEnginePreference.AUTOMATIC,
-            "Automático (recomendado)",
-            "Usa MPV para MKV exigentes y AndroidX Media3 para los demás formatos.",
-        ),
-        Triple(
-            PlaybackEnginePreference.MEDIA3,
-            "AndroidX Media3",
-            "Motor nativo principal; ideal para MP4, HLS y DASH.",
-        ),
-        Triple(
-            PlaybackEnginePreference.MPV,
-            "MPV (alto rendimiento)",
-            "MediaCodec con salida GPU, respaldo por software y subtítulos libass.",
-        ),
-    )
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Motor de reproducción") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(
-                    "Motor activo: ${if (state.active == PlaybackEngine.MPV) "MPV" else "AndroidX Media3"}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(bottom = 8.dp),
-                )
-                options.forEach { (preference, title, detail) ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 56.dp)
-                            .selectable(
-                                selected = state.preference == preference,
-                                role = Role.RadioButton,
-                                onClick = { onSelect(preference) },
-                            )
-                            .padding(horizontal = 4.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        RadioButton(
-                            selected = state.preference == preference,
-                            onClick = null,
-                        )
-                        Column(modifier = Modifier.padding(start = 8.dp)) {
-                            Text(title, style = MaterialTheme.typography.bodyLarge)
-                            Text(
-                                detail,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Cerrar") } },
-    )
-}
-
-private fun playbackEngineSummary(state: PlaybackEngineState): String {
-    val active = if (state.active == PlaybackEngine.MPV) "MPV" else "AndroidX Media3"
-    val preference = when (state.preference) {
-        PlaybackEnginePreference.AUTOMATIC -> "automático"
-        PlaybackEnginePreference.MEDIA3 -> "selección manual Media3"
-        PlaybackEnginePreference.MPV -> "selección manual MPV"
-    }
-    val reason = when (state.reason) {
-        PlaybackEngineReason.MATROSKA_COMPATIBILITY -> "compatibilidad MKV/HEVC"
-        PlaybackEngineReason.DIRECT_SMB_COMPATIBILITY -> "SMB directo"
-        PlaybackEngineReason.SEQUENTIAL_PROVIDER_COMPATIBILITY -> "proveedor sin acceso aleatorio"
-        PlaybackEngineReason.UNVERIFIED_PROVIDER_COMPATIBILITY -> "acceso del proveedor no verificado"
-        PlaybackEngineReason.USER_SELECTION -> "elegido por ti"
-        PlaybackEngineReason.DEFAULT -> "predeterminado"
-    }
-    return "$active · $preference · $reason"
-}
-
-@Composable
 private fun DiagnosticRow(
     label: String,
     value: String,
@@ -861,7 +850,6 @@ private fun formatProcessingOffset(diagnostics: PlaybackDiagnostics): String {
 
 private fun diagnosticsAssessment(
     diagnostics: PlaybackDiagnostics,
-    engine: PlaybackEngineState,
 ): String {
     val averageOffsetMs = if (diagnostics.videoProcessingFrameCount > 0) {
         diagnostics.videoProcessingOffsetUs / diagnostics.videoProcessingFrameCount / 1_000.0
@@ -871,9 +859,6 @@ private fun diagnosticsAssessment(
     return when {
         diagnostics.playerErrorCount > 0 ->
             "El reproductor informó un fallo; revisa el último error debajo."
-        engine.active == PlaybackEngine.MPV ->
-            "MPV activo: MediaCodec/GPU para video y libass para subtítulos. Los contadores " +
-                "internos del decodificador Media3 no están disponibles en este modo."
         diagnostics.loadErrorCount > 0 || diagnostics.bufferingCount >= 3 ->
             "La fuente o la red no están alimentando el buffer de forma estable. Usa SMB directo."
         diagnostics.droppedVideoFrames >= 24 || (averageOffsetMs != null && averageOffsetMs < -30.0) ->
@@ -882,7 +867,7 @@ private fun diagnosticsAssessment(
             "El audio no está llegando o decodificándose a tiempo; prueba otra pista de audio."
         diagnostics.videoDecoderName == null ->
             "Reproduce durante 20–30 segundos para reunir datos del decodificador."
-        else -> "No se detecta todavía una señal clara de red o decodificador."
+        else -> "MPV está activo para video, audio y subtítulos; no se detecta una señal clara de saturación."
     }
 }
 
@@ -937,7 +922,7 @@ private fun RoomTopAppBar(
     onChangeRoom: () -> Unit,
     onDisconnect: () -> Unit,
     onShowDiagnostics: () -> Unit,
-    onShowPlaybackEngine: () -> Unit,
+    onShowSubtitleCustomization: () -> Unit,
 ) {
     val connected = state.connectionStatus as? ConnectionStatus.Connected
     val secure = connected?.secure == true
@@ -1030,11 +1015,11 @@ private fun RoomTopAppBar(
                     onDismissRequest = { overflowExpanded = false },
                 ) {
                     DropdownMenuItem(
-                        text = { Text("Motor de reproducción") },
-                        leadingIcon = { Icon(Icons.Rounded.Movie, contentDescription = null) },
+                        text = { Text("Personalizar subtítulos") },
+                        leadingIcon = { Icon(Icons.Rounded.Tune, contentDescription = null) },
                         onClick = {
                             overflowExpanded = false
-                            onShowPlaybackEngine()
+                            onShowSubtitleCustomization()
                         },
                     )
                     DropdownMenuItem(
@@ -1168,7 +1153,13 @@ private fun PlayerPane(
     onOpenUrl: () -> Unit,
     onOpenSmb: () -> Unit,
     onOpenSubtitleSelector: () -> Unit,
+    onSubtitleCustomization: () -> Unit,
     onFullscreenChange: (Boolean) -> Unit,
+    onTogglePlayback: () -> Unit,
+    onSeekTo: (Long) -> Unit,
+    onSeekBy: (Long) -> Unit,
+    onAttachVideoOutput: (Any?) -> Unit,
+    onClearVideoOutput: (Any?) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val hasMedia = state.media != null
@@ -1185,14 +1176,18 @@ private fun PlayerPane(
         contentAlignment = Alignment.Center,
     ) {
         val tightEmptyState = !hasMedia && maxHeight < 280.dp
-        val player = state.player
-        if (player != null && state.media != null) {
-            Media3PlayerView(
-                player = player,
-                playbackEngine = state.playbackEngine.active,
+        if (state.playerAvailable && state.media != null) {
+            MpvPlayerSurface(
+                state = state,
                 isFullscreen = false,
                 controlsEnabled = !state.isMediaLoading,
                 onFullscreenChange = onFullscreenChange,
+                onTogglePlayback = onTogglePlayback,
+                onSeekTo = onSeekTo,
+                onSeekBy = onSeekBy,
+                onSubtitleCustomization = onSubtitleCustomization,
+                onAttachVideoOutput = onAttachVideoOutput,
+                onClearVideoOutput = onClearVideoOutput,
             )
         }
         if (state.media == null) {
@@ -1339,90 +1334,164 @@ private fun PlayerPane(
     }
 }
 
-@androidx.annotation.OptIn(UnstableApi::class)
-internal fun bindPlayerViewToEngine(
-    playerView: PlayerView,
-    player: Player,
-    playbackEngine: PlaybackEngine,
-) {
-    // MediaController remains the same Java object when MediaSession swaps its backing player.
-    // Reattaching makes it send the current Surface to the new decoder instead of leaving it on
-    // the previous one (the symptom is audio playing behind a permanently black video area).
-    if (
-        playerView.player !== player ||
-        playerView.getTag(R.id.player_view_playback_engine) != playbackEngine
-    ) {
-        playerView.player = null
-        playerView.setTag(R.id.player_view_playback_engine, playbackEngine)
-        playerView.player = player
-    }
-}
-
-@androidx.annotation.OptIn(UnstableApi::class)
 @Composable
-private fun Media3PlayerView(
-    player: Player,
-    playbackEngine: PlaybackEngine,
+private fun MpvPlayerSurface(
+    state: SyncplayUiState,
     isFullscreen: Boolean,
     controlsEnabled: Boolean = true,
     onFullscreenChange: (Boolean) -> Unit,
+    onTogglePlayback: () -> Unit,
+    onSeekTo: (Long) -> Unit,
+    onSeekBy: (Long) -> Unit,
+    onSubtitleCustomization: () -> Unit,
+    onAttachVideoOutput: (Any?) -> Unit,
+    onClearVideoOutput: (Any?) -> Unit,
 ) {
-    AndroidView(
-        factory = { context ->
-            PlayerView(context).apply {
-                setBackgroundColor(AndroidColor.BLACK)
-                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-                useController = controlsEnabled
-                controllerAutoShow = true
-                controllerShowTimeoutMs = 3_000
-                setShowSubtitleButton(false)
-                setShowShuffleButton(false)
-                setShowNextButton(false)
-                setShowPreviousButton(false)
-                setKeepContentOnPlayerReset(true)
-                setEnableComposeSurfaceSyncWorkaround(true)
-                keepScreenOn = true
-                bindPlayerViewToEngine(this, player, playbackEngine)
-                setFullscreenButtonClickListener(onFullscreenChange)
-                setFullscreenButtonState(isFullscreen)
+    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+        AndroidView(
+            factory = { context ->
+                SurfaceView(context).apply {
+                    setZOrderMediaOverlay(false)
+                    setBackgroundColor(android.graphics.Color.BLACK)
+                    keepScreenOn = true
+                    onAttachVideoOutput(this)
+                }
+            },
+            update = { onAttachVideoOutput(it) },
+            onRelease = { onClearVideoOutput(it) },
+            modifier = Modifier.fillMaxSize(),
+        )
+        SubtitleTextOverlay(
+            text = state.subtitleText.orEmpty(),
+            appearance = state.subtitlePreferences.appearance,
+            modifier = Modifier.fillMaxSize(),
+        )
+        if (controlsEnabled) {
+            MpvControls(
+                state = state,
+                isFullscreen = isFullscreen,
+                onFullscreenChange = onFullscreenChange,
+                onTogglePlayback = onTogglePlayback,
+                onSeekTo = onSeekTo,
+                onSeekBy = onSeekBy,
+                onSubtitleCustomization = onSubtitleCustomization,
+                modifier = Modifier.align(Alignment.BottomCenter),
+            )
+        }
+    }
+}
+
+@Composable
+private fun MpvControls(
+    state: SyncplayUiState,
+    isFullscreen: Boolean,
+    onFullscreenChange: (Boolean) -> Unit,
+    onTogglePlayback: () -> Unit,
+    onSeekTo: (Long) -> Unit,
+    onSeekBy: (Long) -> Unit,
+    onSubtitleCustomization: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val duration = state.playback.durationMs.coerceAtLeast(0L)
+    var draggedPosition by remember(duration) { mutableStateOf<Float?>(null) }
+    val displayedPosition = draggedPosition
+        ?: state.playback.positionMs.coerceIn(0L, duration.takeIf { it > 0L } ?: 1L).toFloat()
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        color = Color.Black.copy(alpha = 0.64f),
+        contentColor = Color.White,
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+            Slider(
+                value = displayedPosition,
+                onValueChange = { draggedPosition = it },
+                onValueChangeFinished = {
+                    draggedPosition?.let { onSeekTo(it.toLong()) }
+                    draggedPosition = null
+                },
+                valueRange = 0f..duration.coerceAtLeast(1L).toFloat(),
+                enabled = state.playback.isSeekable && duration > 0L,
+                modifier = Modifier.fillMaxWidth().semantics {
+                    stateDescription = "${formatDurationMs(displayedPosition.toLong())} de ${formatDurationMs(duration)}"
+                },
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                IconButton(onClick = { onSeekBy(-5_000L) }, enabled = state.playback.isSeekable) {
+                    Icon(Icons.Rounded.Replay5, contentDescription = "Retroceder 5 segundos")
+                }
+                IconButton(onClick = onTogglePlayback) {
+                    Icon(
+                        if (state.playback.paused) Icons.Rounded.PlayArrow else Icons.Rounded.Pause,
+                        contentDescription = if (state.playback.paused) "Reproducir" else "Pausar",
+                        modifier = Modifier.size(34.dp),
+                    )
+                }
+                IconButton(onClick = { onSeekBy(10_000L) }, enabled = state.playback.isSeekable) {
+                    Icon(Icons.Rounded.Forward10, contentDescription = "Adelantar 10 segundos")
+                }
+                Text(
+                    "${formatDurationMs(displayedPosition.toLong())} · ${formatDurationMs(duration)}",
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                IconButton(onClick = onSubtitleCustomization) {
+                    Icon(Icons.Rounded.Tune, contentDescription = "Personalizar subtítulos")
+                }
+                IconButton(onClick = { onFullscreenChange(!isFullscreen) }) {
+                    Icon(
+                        if (isFullscreen) Icons.Rounded.FullscreenExit else Icons.Rounded.Fullscreen,
+                        contentDescription = if (isFullscreen) "Salir de pantalla completa" else "Pantalla completa",
+                    )
+                }
             }
-        },
-        update = {
-            bindPlayerViewToEngine(it, player, playbackEngine)
-            it.useController = controlsEnabled
-            it.setShowSubtitleButton(false)
-            it.setFullscreenButtonClickListener(onFullscreenChange)
-            it.setFullscreenButtonState(isFullscreen)
-        },
-        onRelease = {
-            it.setFullscreenButtonClickListener(null)
-            it.player = null
-        },
-        modifier = Modifier.fillMaxSize(),
-    )
+        }
+    }
 }
 
 @Composable
 private fun FullscreenPlayerScreen(
-    player: Player?,
-    playbackEngine: PlaybackEngine,
+    state: SyncplayUiState,
     isMediaLoading: Boolean,
     isSubtitleLoading: Boolean,
     onFullscreenChange: (Boolean) -> Unit,
     onSubtitle: () -> Unit,
+    onSubtitleCustomization: () -> Unit,
+    onTogglePlayback: () -> Unit,
+    onSeekTo: (Long) -> Unit,
+    onSeekBy: (Long) -> Unit,
+    onAttachVideoOutput: (Any?) -> Unit,
+    onClearVideoOutput: (Any?) -> Unit,
 ) {
     Box(
         modifier = Modifier.fillMaxSize().background(Color.Black),
         contentAlignment = Alignment.Center,
     ) {
-        if (player != null) {
-            Media3PlayerView(
-                player = player,
-                playbackEngine = playbackEngine,
+        if (state.playerAvailable) {
+            MpvPlayerSurface(
+                state = state,
                 isFullscreen = true,
                 controlsEnabled = !isMediaLoading,
                 onFullscreenChange = onFullscreenChange,
+                onTogglePlayback = onTogglePlayback,
+                onSeekTo = onSeekTo,
+                onSeekBy = onSeekBy,
+                onSubtitleCustomization = onSubtitleCustomization,
+                onAttachVideoOutput = onAttachVideoOutput,
+                onClearVideoOutput = onClearVideoOutput,
             )
+        }
+        Surface(
+            modifier = Modifier.align(Alignment.TopStart).windowInsetsPadding(WindowInsets.safeDrawing).padding(12.dp),
+            shape = CircleShape,
+            color = Color.Black.copy(alpha = 0.72f),
+            contentColor = Color.White,
+        ) {
+            IconButton(onClick = onSubtitleCustomization, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Rounded.Tune, contentDescription = "Personalizar subtítulos")
+            }
         }
         Surface(
             modifier = Modifier

@@ -32,7 +32,7 @@ enum class SourceAccessClassification(
 /**
  * Opens a content URI only long enough to inspect its descriptor type and seekability.
  *
- * No bytes are read and no descriptor owned by Media3 is touched.  The temporary descriptor is
+ * No bytes are read and no descriptor retained by MPV is touched. The temporary descriptor is
  * always closed before this method returns.  Call this from a worker/IO dispatcher; document
  * providers are allowed to perform network work while opening a descriptor.
  */
@@ -89,7 +89,7 @@ object ContentUriAccessProbe {
             throw cancelled
         } catch (_: Exception) {
             // Access probes are advisory.  A stale grant, a provider crash, or an unsupported
-            // open mode must not prevent Media3 from attempting its normal open path.
+            // open mode must not prevent MPV from attempting its normal open path.
             SourceAccessClassification.UNKNOWN
         } finally {
             timeout.cancel(false)

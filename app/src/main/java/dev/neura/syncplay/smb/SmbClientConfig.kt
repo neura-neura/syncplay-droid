@@ -11,7 +11,7 @@ import java.util.concurrent.TimeUnit
  *
  * SMB reads are long-lived and usually happen over Wi-Fi, a VPN, or a ZeroTier link.  The
  * explicit dialect list keeps negotiation on SMB2/SMB3 (SMB1 is never enabled), the bounded
- * socket/read timeouts let Media3 retry a dropped connection, and the larger buffers avoid
+ * socket/read timeouts let the MPV bridge retry a dropped connection, and larger buffers avoid
  * turning a sequential extractor read into thousands of small SMB requests.  Signing remains
  * enabled (it is optional rather than required), while SMB encryption stays disabled for the
  * Android-compatible SMBJ path used by this app.

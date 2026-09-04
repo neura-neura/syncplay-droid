@@ -45,7 +45,7 @@ data class ResolvedMediaInfo(
 }
 
 /**
- * Resolves stable metadata for the local media URI used by ExoPlayer and by
+ * Resolves stable metadata for the local media URI used by MPV and by
  * the Syncplay file descriptor.  All methods are synchronous; use them from
  * a worker dispatcher when called by UI or service code.
  */
@@ -87,7 +87,7 @@ object MediaInfoResolver {
         // an SMB location exposed by a file manager).  MediaMetadataRetriever
         // performs a synchronous read when given a content URI and some
         // providers do not return until the remote file has been opened.  That
-        // probe can take longer than Syncplay's heartbeat timeout.  Media3 will
+        // probe can take longer than Syncplay's heartbeat timeout. MPV will
         // discover the duration after prepare(), so leave it unknown here for
         // all provider URIs and keep the control connection independent.
         val durationSeconds = if (isContentUri(uri) || smbScheme) {
@@ -96,7 +96,7 @@ object MediaInfoResolver {
             queryDurationSeconds(context, uri)
         }
         // Probe through a separate, short-lived descriptor.  This never consumes the descriptor
-        // that Media3 will open and callers already invoke resolve() on a worker dispatcher.
+        // that MPV will open and callers already invoke resolve() on a worker dispatcher.
         val sourceAccess = if (directSmb) {
             SourceAccessClassification.SEEKABLE
         } else if (smbScheme) {
@@ -109,7 +109,7 @@ object MediaInfoResolver {
             displayName = displayName,
             sizeBytes = sizeBytes,
             durationSeconds = durationSeconds,
-            // Media3 and subtitle extension mapping can infer provider content. Avoid a second
+            // MPV and subtitle extension mapping can infer provider content. Avoid a second
             // potentially remote provider call after the bounded metadata query.
             mimeType = if (isContentUri(uri) || smbScheme) {
                 null

@@ -1,6 +1,5 @@
 package dev.neura.syncplay.ui
 
-import androidx.media3.common.MimeTypes
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -14,6 +13,11 @@ class SubtitleFileTypesTest {
         assertEquals(SubtitleFileType.VTT, SubtitleFileTypes.typeForName("movie.vtt"))
         assertEquals(SubtitleFileType.TTML, SubtitleFileTypes.typeForName("movie.ttml"))
         assertEquals(SubtitleFileType.XML, SubtitleFileTypes.typeForName("movie.xml"))
+        assertEquals(SubtitleFileType.ZIP, SubtitleFileTypes.typeForName("captions.ZIP"))
+        assertEquals(SubtitleFileType.SUP, SubtitleFileTypes.typeForName("movie.sup"))
+        assertEquals(SubtitleFileType.PGS, SubtitleFileTypes.typeForName("movie.pgs"))
+        assertNull(SubtitleFileTypes.typeForName("movie.idx"))
+        assertNull(SubtitleFileTypes.typeForName("movie.sub"))
     }
 
     @Test
@@ -34,15 +38,15 @@ class SubtitleFileTypesTest {
     @Test
     fun extensionAlwaysWinsOverProviderMime() {
         assertEquals(
-            MimeTypes.TEXT_SSA,
+            SubtitleFileType.ASS.mimeType,
             SubtitleFileTypes.mimeTypeFor("movie.ass", "audio/aac"),
         )
         assertEquals(
-            MimeTypes.APPLICATION_SUBRIP,
+            SubtitleFileType.SRT.mimeType,
             SubtitleFileTypes.mimeTypeFor("movie.srt", "text/plain; charset=utf-8"),
         )
         assertEquals(
-            MimeTypes.TEXT_VTT,
+            SubtitleFileType.VTT.mimeType,
             SubtitleFileTypes.mimeTypeFor("movie.vtt", "application/octet-stream"),
         )
     }
@@ -50,7 +54,7 @@ class SubtitleFileTypesTest {
     @Test
     fun knownProviderMimeCanBeUsedOnlyAsExplicitFallback() {
         assertEquals(
-            MimeTypes.TEXT_SSA,
+            SubtitleFileType.ASS.mimeType,
             SubtitleFileTypes.mimeTypeFor("unknown", "text/x-ssa"),
         )
         assertNull(SubtitleFileTypes.mimeTypeFor("unknown", "audio/aac"))

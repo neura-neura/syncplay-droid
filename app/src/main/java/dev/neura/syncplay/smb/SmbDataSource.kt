@@ -1,13 +1,6 @@
 package dev.neura.syncplay.smb
 
-import android.annotation.SuppressLint
 import android.net.Uri
-import androidx.media3.common.C
-import androidx.media3.datasource.BaseDataSource
-import androidx.media3.datasource.DataSource
-import androidx.media3.datasource.DataSpec
-import androidx.media3.datasource.DefaultDataSource
-import androidx.media3.datasource.TransferListener
 import com.hierynomus.msdtyp.AccessMask
 import com.hierynomus.msfscc.FileAttributes
 import com.hierynomus.msfscc.fileinformation.FileStandardInformation
@@ -19,9 +12,24 @@ import com.hierynomus.smbj.connection.Connection
 import com.hierynomus.smbj.session.Session
 import com.hierynomus.smbj.share.DiskShare
 import com.hierynomus.smbj.share.File as SmbFile
+import java.io.BufferedReader
 import java.io.Closeable
 import java.io.IOException
+import java.io.InputStream
+import java.io.InputStreamReader
+import java.io.OutputStream
+import java.net.InetSocketAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.net.SocketException
+import java.nio.charset.Charset
+import java.nio.charset.StandardCharsets
 import java.util.EnumSet
+import java.util.LinkedHashMap
+import java.util.Locale
+import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.ThreadFactory
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Pure sizing rules for the bounded sequential read-ahead window. */
@@ -52,492 +60,517 @@ internal object SmbReadAheadPolicy {
 }
 
 /**
- * Media3 DataSource backed by a single open SMB2/SMB3 file.
+ * A seekable MPV source backed by one process-local SMB lease.
  *
- * Each source owns its SMB client and credentials are fetched from the process-local registry only
- * while opening a file. Reads use SMBJ's positional API, so a Media3 seek does not need to drain
- * bytes from the beginning of the file. Small sequential reads are served from a bounded (2 MiB
- * by default) window filled with one positional SMB READ. A failed read gets one fresh connection
- * before the error is returned to ExoPlayer.
+ * [location] is deliberately a loopback URL containing only an opaque token. The SMB host,
+ * share, path, username, and password never leave this process. Call [close] when MPV no longer
+ * needs the source; closing the lease shuts down the loopback server and SMB connection.
  */
-@SuppressLint("UnsafeOptInUsageError") // This class is the app's intentional Media3 DataSource boundary.
-class SmbDataSource internal constructor(
-    private val profiles: SmbConnectionProfileRegistry,
-    private val maxReadChunkBytes: Int = DEFAULT_MAX_READ_CHUNK_BYTES,
-    private val readAheadBytes: Int = DEFAULT_READ_AHEAD_BYTES,
-) : BaseDataSource(/* isNetwork = */ true) {
-    init {
-        require(maxReadChunkBytes in MIN_READ_CHUNK_BYTES..MAX_READ_CHUNK_BYTES) {
-            "SMB read chunk must be between $MIN_READ_CHUNK_BYTES and $MAX_READ_CHUNK_BYTES bytes"
-        }
-        require(readAheadBytes in MIN_READ_CHUNK_BYTES..MAX_READ_AHEAD_BYTES) {
-            "SMB read-ahead must be between $MIN_READ_CHUNK_BYTES and $MAX_READ_AHEAD_BYTES bytes"
-        }
-    }
+data class SmbMpvSource(
+    val location: String,
+    val length: Long,
+    private val lease: Closeable,
+) : Closeable {
+    private val closed = AtomicBoolean(false)
+    internal var onClosed: ((SmbMpvSource) -> Unit)? = null
 
-    // A caller may lower the SMB request cap for a particular server. Never allocate or request a
-    // read-ahead window larger than that cap; this also keeps every request within the existing
-    // 8 MiB safety bound.
-    private val readAheadCapacityBytes =
-        SmbReadAheadPolicy.effectiveCapacity(readAheadBytes, maxReadChunkBytes)
-
-    private val stateLock = Any()
-    private var handle: SmbFileHandle? = null
-    private var requestUri: Uri? = null
-    private var dataSpec: DataSpec? = null
-    private var bytesRemaining = C.LENGTH_UNSET.toLong()
-    private var position = 0L
-    private var opened = false
-    private var stateGeneration = 0L
-    private var transferState = TransferState.NONE
-    private var readAheadBuffer: ByteArray? = null
-    private var readAheadOffset = 0
-    private var readAheadLength = 0
-    /** Serializes transfer callbacks only; SMB network I/O never runs while this is held. */
-    private val transferCallbackLock = Any()
-
-    override fun open(dataSpec: DataSpec): Long {
-        // Media3 normally closes before opening again; closing defensively here keeps a failed
-        // source from retaining a socket when a caller reuses a DataSource instance.
-        close()
-        transferInitializing(dataSpec)
-
-        val location = try {
-            SmbUri.parse(dataSpec.uri)
-        } catch (error: IllegalArgumentException) {
-            throw IOException("Invalid SMB media URI", error)
-        }
-        val profile = profiles.get(location.profileId)
-            ?: throw IOException("Unknown SMB connection profile")
-        val openGeneration = synchronized(stateLock) { stateGeneration }
-        val newHandle = SmbFileHandle(profile, location)
-        var transferStartNotified = false
-        try {
-            val fileLength = newHandle.open()
-            val start = dataSpec.position
-            require(start >= 0L) { "SMB data position must not be negative" }
-            if (start > fileLength) {
-                throw IOException("SMB data position is outside the file")
-            }
-            val requestedLength = dataSpec.length
-            if (requestedLength != C.LENGTH_UNSET.toLong() && requestedLength < 0L) {
-                throw IOException("SMB data length must not be negative")
-            }
-            val available = fileLength - start
-            if (requestedLength != C.LENGTH_UNSET.toLong() && requestedLength > available) {
-                throw IOException("SMB data range is outside the file")
-            }
-            val remaining = if (requestedLength == C.LENGTH_UNSET.toLong()) available else requestedLength
-
-            synchronized(stateLock) {
-                if (stateGeneration != openGeneration) {
-                    // A concurrent close may have completed between the first close() and this
-                    // assignment. Do not leak the newly opened handle in that case.
-                    newHandle.close()
-                    throw IOException("SMB data source was closed while opening")
-                }
-                handle = newHandle
-                requestUri = dataSpec.uri
-                this.dataSpec = dataSpec
-                bytesRemaining = remaining
-                position = start
-                opened = true
-                // Keep close() from reporting transferEnded before transferStarted has been
-                // delivered when a provider closes the source concurrently with open().
-                transferState = TransferState.STARTING
-                // Allocate once per open and reuse for all small extractor reads. Keep tiny files
-                // and bounded DataSpec ranges from paying for the full default window. A reopen /
-                // seek gets a fresh empty window, so bytes from the previous DataSpec can never
-                // leak.
-                val windowBytes = SmbReadAheadPolicy.windowLength(
-                    remainingBytes = remaining,
-                    capacityBytes = readAheadCapacityBytes,
-                )
-                readAheadBuffer = windowBytes.takeIf { it > 0 }?.let { ByteArray(it) }
-                readAheadOffset = 0
-                readAheadLength = 0
-            }
-            synchronized(transferCallbackLock) {
-                transferStarted(dataSpec)
-                transferStartNotified = true
-                val endedBeforeStart = synchronized(stateLock) {
-                    if (opened && handle === newHandle && stateGeneration == openGeneration &&
-                        transferState == TransferState.STARTING
-                    ) {
-                        transferState = TransferState.STARTED
-                        false
-                    } else {
-                        // close() detached this request while the listener callback was running.
-                        // Balance the callback now, after the state lock is released.
-                        transferState = TransferState.NONE
-                        true
-                    }
-                }
-                if (endedBeforeStart) transferEnded()
-            }
-            return remaining
-        } catch (error: IOException) {
-            val endTransfer = clearFailedOpen(newHandle)
-            newHandle.close()
-            if (endTransfer && transferStartNotified) {
-                synchronized(transferCallbackLock) { transferEnded() }
-            }
-            throw error
-        } catch (error: Exception) {
-            val endTransfer = clearFailedOpen(newHandle)
-            newHandle.close()
-            if (endTransfer && transferStartNotified) {
-                synchronized(transferCallbackLock) { transferEnded() }
-            }
-            throw IOException("Unable to open SMB media", error)
-        }
-    }
-
-    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
-        if (offset < 0 || length < 0 || offset > buffer.size - length) {
-            throw IndexOutOfBoundsException("Invalid SMB read buffer range")
-        }
-        if (length == 0) return 0
-
-        var bufferedCount = 0
-        var readHandle: SmbFileHandle? = null
-        var readGeneration = 0L
-        var remotePosition = 0L
-        var remoteRequestLength = 0
-        var remoteBuffer: ByteArray? = null
-        var remoteBufferOffset = 0
-        var useReadAhead = false
-        synchronized(transferCallbackLock) {
-            synchronized(stateLock) {
-                if (!opened) throw IOException("SMB data source is not open")
-                if (bytesRemaining == 0L) return -1
-
-                val available = readAheadLength
-                if (available > 0) {
-                    val source = readAheadBuffer
-                        ?: throw IOException("SMB read-ahead buffer is missing")
-                    bufferedCount = minOf(length, available, bytesRemaining.toIntSafely())
-                    System.arraycopy(source, readAheadOffset, buffer, offset, bufferedCount)
-                    position += bufferedCount
-                    if (bytesRemaining != C.LENGTH_UNSET.toLong()) {
-                        bytesRemaining = (bytesRemaining - bufferedCount).coerceAtLeast(0L)
-                    }
-                    readAheadOffset += bufferedCount
-                    readAheadLength -= bufferedCount
-                    if (readAheadLength == 0) readAheadOffset = 0
-                } else {
-                    val activeHandle = handle ?: throw IOException("SMB data source has no open file")
-                    readHandle = activeHandle
-                    readGeneration = stateGeneration
-                    remotePosition = position
-                    val requested = minOf(length, maxReadChunkBytes, bytesRemaining.toIntSafely())
-                    useReadAhead = SmbReadAheadPolicy.shouldReadAhead(
-                        requestedBytes = requested,
-                        capacityBytes = readAheadCapacityBytes,
-                    )
-                    remoteRequestLength = if (useReadAhead) {
-                        SmbReadAheadPolicy.prefetchLength(
-                            remainingBytes = bytesRemaining,
-                            capacityBytes = readAheadCapacityBytes,
-                            maxChunkBytes = maxReadChunkBytes,
-                        )
-                    } else {
-                        requested
-                    }
-                    remoteBuffer = if (useReadAhead) {
-                        readAheadBuffer ?: throw IOException("SMB read-ahead buffer is missing")
-                    } else {
-                        buffer
-                    }
-                    remoteBufferOffset = if (useReadAhead) 0 else offset
-                }
-            }
-            if (bufferedCount > 0) bytesTransferred(bufferedCount)
-        }
-
-        if (bufferedCount > 0) {
-            return bufferedCount
-        }
-
-        val activeHandle = readHandle ?: throw IOException("SMB data source has no open file")
-        val target = remoteBuffer ?: throw IOException("SMB read target is missing")
-        val count = try {
-            activeHandle.read(target, remoteBufferOffset, remoteRequestLength, remotePosition)
-        } catch (error: Exception) {
-            // A dropped Wi-Fi connection or an SMB server idle timeout is recoverable. The
-            // handle reopens at the requested offset and retries once; close() marks it terminal.
-            // If close()/open() already invalidated this request, do not reconnect a terminal
-            // handle or surface its cancellation as a media load error.
-            if (!isCurrentRead(activeHandle, readGeneration, remotePosition)) return -1
-            invalidateReadAheadForReconnect(activeHandle, readGeneration, remotePosition)
-            try {
-                activeHandle.reconnect()
-                activeHandle.read(target, remoteBufferOffset, remoteRequestLength, remotePosition)
-            } catch (retryError: Exception) {
-                if (!isCurrentRead(activeHandle, readGeneration, remotePosition)) return -1
-                if (retryError is IOException) throw retryError
-                throw IOException("Unable to read SMB media", retryError)
-            }
-        }
-        if (count < 0) {
-            synchronized(stateLock) {
-                if (opened && handle === activeHandle && stateGeneration == readGeneration &&
-                    position == remotePosition
-                ) {
-                    bytesRemaining = 0L
-                    readAheadOffset = 0
-                    readAheadLength = 0
-                }
-            }
-            return -1
-        }
-        if (count == 0) {
-            // A zero-byte response for a positive request would make Media3 spin forever. Treat it
-            // as a transport failure so the loader can apply its normal retry policy.
-            throw IOException("SMB server returned an empty read")
-        }
-        if (count > remoteRequestLength) {
-            throw IOException("SMB server returned more bytes than requested")
-        }
-
-        var deliveredCount = 0
-        synchronized(transferCallbackLock) {
-            synchronized(stateLock) {
-                // close() or a concurrent read can race a network read. Do not update a newly
-                // opened request, or advance the same position twice with stale bytes from
-                // another read.
-                if (!opened || handle !== activeHandle || stateGeneration != readGeneration ||
-                    position != remotePosition
-                ) {
-                    return -1
-                }
-                if (useReadAhead) {
-                    val source = readAheadBuffer
-                    if (source == null || source !== target) {
-                        return -1
-                    }
-                    readAheadOffset = 0
-                    readAheadLength = count
-                    deliveredCount = minOf(length, count, bytesRemaining.toIntSafely())
-                    System.arraycopy(source, 0, buffer, offset, deliveredCount)
-                    position += deliveredCount
-                    if (bytesRemaining != C.LENGTH_UNSET.toLong()) {
-                        bytesRemaining = (bytesRemaining - deliveredCount).coerceAtLeast(0L)
-                    }
-                    readAheadOffset = deliveredCount
-                    readAheadLength -= deliveredCount
-                    if (readAheadLength == 0) readAheadOffset = 0
-                } else {
-                    deliveredCount = count
-                    position += count
-                    if (bytesRemaining != C.LENGTH_UNSET.toLong()) {
-                        bytesRemaining = (bytesRemaining - count).coerceAtLeast(0L)
-                    }
-                }
-            }
-            // Keep transferEnded() behind this callback when close() races the state commit. The
-            // lock is acquired only after SMB I/O has completed.
-            bytesTransferred(deliveredCount)
-        }
-        return deliveredCount
-    }
-
-    private fun isCurrentRead(
-        expectedHandle: SmbFileHandle,
-        expectedGeneration: Long,
-        expectedPosition: Long,
-    ): Boolean = synchronized(stateLock) {
-        opened && handle === expectedHandle && stateGeneration == expectedGeneration &&
-            position == expectedPosition
-    }
-
-    /** Reconnect starts a fresh transport, so discard any window tied to the failed transport. */
-    private fun invalidateReadAheadForReconnect(
-        expectedHandle: SmbFileHandle,
-        expectedGeneration: Long,
-        expectedPosition: Long,
-    ) {
-        synchronized(stateLock) {
-            if (opened && handle === expectedHandle && stateGeneration == expectedGeneration &&
-                position == expectedPosition
-            ) {
-                readAheadOffset = 0
-                readAheadLength = 0
-            }
-        }
-    }
-
-    override fun getUri(): Uri? = synchronized(stateLock) { requestUri }
+    /** Alias used by callers that name the value as a byte size. */
+    val sizeBytes: Long
+        get() = length
 
     override fun close() {
-        val oldHandle: SmbFileHandle?
-        val wasTransferStarted: Boolean
-        synchronized(stateLock) {
-            oldHandle = handle
-            stateGeneration++
-            handle = null
-            requestUri = null
-            dataSpec = null
-            bytesRemaining = C.LENGTH_UNSET.toLong()
-            position = 0L
-            opened = false
-            readAheadBuffer = null
-            readAheadOffset = 0
-            readAheadLength = 0
-            wasTransferStarted = transferState == TransferState.STARTED
-            // A STARTING transfer is balanced by open() after its callback returns. Only a
-            // STARTED transfer can be ended here.
-            transferState = TransferState.NONE
+        if (!closed.compareAndSet(false, true)) return
+        try {
+            lease.close()
+        } finally {
+            onClosed?.invoke(this)
+            onClosed = null
         }
-        // Detach before closing so a blocked SMB read observes the terminal handle immediately.
-        // End the transfer before the potentially blocking resource close, while serializing with
-        // bytesTransferred() so listeners always see bytes before transferEnded().
-        if (wasTransferStarted) {
-            synchronized(transferCallbackLock) { transferEnded() }
+    }
+}
+
+/** Open an SMB file as a bounded random-access reader and expose it through a loopback URL. */
+internal fun openSmbMpvSource(
+    uri: Uri,
+    profiles: SmbConnectionProfileRegistry,
+): SmbMpvSource {
+    val location = try {
+        SmbUri.parse(uri)
+    } catch (error: IllegalArgumentException) {
+        throw IOException("Invalid SMB media URI", error)
+    }
+    val profile = profiles.get(location.profileId)
+        ?: throw IOException("Unknown SMB connection profile")
+    val handle = SmbFileHandle(profile, location)
+    return try {
+        val length = handle.open()
+        val reader = SmbRandomAccessReader(handle, length)
+        val server = SmbLoopbackRangeServer(reader)
+        try {
+            server.start()
+            SmbMpvSource(
+                location = server.location,
+                length = length,
+                lease = SmbSourceLease(reader, server),
+            )
+        } catch (error: Exception) {
+            server.close()
+            reader.close()
+            throw if (error is IOException) error else IOException("Unable to start SMB source", error)
         }
-        oldHandle?.close()
+    } catch (error: Exception) {
+        handle.close()
+        throw if (error is IOException) error else IOException("Unable to open SMB media", error)
+    }
+}
+
+/** Open an SMB URI as a sequential stream. The stream owns and closes its SMB lease. */
+internal fun openSmbInputStream(
+    uri: Uri,
+    profiles: SmbConnectionProfileRegistry,
+): InputStream {
+    val location = try {
+        SmbUri.parse(uri)
+    } catch (error: IllegalArgumentException) {
+        throw IOException("Invalid SMB media URI", error)
+    }
+    val profile = profiles.get(location.profileId)
+        ?: throw IOException("Unknown SMB connection profile")
+    val handle = SmbFileHandle(profile, location)
+    return try {
+        val length = handle.open()
+        SmbSequentialInputStream(SmbRandomAccessReader(handle, length))
+    } catch (error: Exception) {
+        handle.close()
+        throw if (error is IOException) error else IOException("Unable to open SMB stream", error)
+    }
+}
+
+/** A byte interval with inclusive endpoints, suitable for a single HTTP Range request. */
+internal data class SmbByteRange(
+    val start: Long,
+    val endInclusive: Long,
+) {
+    init {
+        require(start >= 0L) { "Range start must not be negative" }
+        require(endInclusive >= start) { "Range end must not precede start" }
     }
 
-    /** Clear state when a listener/open failure occurs after the handle was attached. */
-    private fun clearFailedOpen(expectedHandle: SmbFileHandle): Boolean = synchronized(stateLock) {
-        if (handle !== expectedHandle) return@synchronized false
-        val wasTransferStarted = transferState == TransferState.STARTED
-        handle = null
-        requestUri = null
-        dataSpec = null
-        bytesRemaining = C.LENGTH_UNSET.toLong()
-        position = 0L
-        opened = false
-        readAheadBuffer = null
-        readAheadOffset = 0
-        readAheadLength = 0
-        transferState = TransferState.NONE
-        stateGeneration++
-        wasTransferStarted
-    }
+    val length: Long
+        get() = endInclusive - start + 1L
+}
 
-    private fun Long.toIntSafely(): Int = when {
-        this <= 0L -> 0
-        this >= Int.MAX_VALUE.toLong() -> Int.MAX_VALUE
-        else -> toInt()
-    }
+/** Result of parsing one RFC 7233 byte-range header. */
+internal sealed class SmbRangeResult {
+    data object Absent : SmbRangeResult()
+    data class Satisfied(val range: SmbByteRange) : SmbRangeResult()
+    data object Unsatisfiable : SmbRangeResult()
+    data object Malformed : SmbRangeResult()
+}
 
-    /** Factory that resolves profile ids against a process-local registry. */
-    @SuppressLint("UnsafeOptInUsageError")
-    class Factory(
-        private val profiles: SmbConnectionProfileRegistry,
-        private val maxReadChunkBytes: Int = DEFAULT_MAX_READ_CHUNK_BYTES,
-        private val readAheadBytes: Int = DEFAULT_READ_AHEAD_BYTES,
-    ) : DataSource.Factory {
-        private var transferListener: TransferListener? = null
+/** Deterministic HTTP response metadata for a parsed range request. */
+internal data class SmbRangeResponse(
+    val status: Int,
+    val contentLength: Long,
+    val contentRange: String? = null,
+)
 
-        fun setTransferListener(listener: TransferListener?): Factory = apply {
-            transferListener = listener
+/** Pure Range parsing and response policy, kept independent of sockets for deterministic tests. */
+internal object SmbRangeProtocol {
+    fun parseRangeHeader(header: String?, resourceLength: Long): SmbRangeResult {
+        require(resourceLength >= 0L) { "Resource length must not be negative" }
+        if (header.isNullOrBlank()) return SmbRangeResult.Absent
+        val value = header.trim()
+        if (!value.regionMatches(0, "bytes=", 0, 6, ignoreCase = true)) {
+            return SmbRangeResult.Malformed
         }
+        val spec = value.substring(6).trim()
+        // The bridge intentionally supports one range only. A caller can issue another request
+        // for a different interval, while rejecting multipart responses keeps the implementation
+        // deterministic and avoids accidental unbounded buffering.
+        if (spec.isEmpty() || spec.indexOf(',') >= 0 || spec.indexOf('-') < 0) {
+            return SmbRangeResult.Malformed
+        }
+        val dash = spec.indexOf('-')
+        if (dash != spec.lastIndexOf('-')) return SmbRangeResult.Malformed
+        val first = spec.substring(0, dash).trim()
+        val second = spec.substring(dash + 1).trim()
+        if (first.isEmpty()) {
+            val suffixLength = second.toLongOrNull() ?: return SmbRangeResult.Malformed
+            if (suffixLength <= 0L || resourceLength == 0L) return SmbRangeResult.Unsatisfiable
+            val start = (resourceLength - suffixLength).coerceAtLeast(0L)
+            return SmbRangeResult.Satisfied(SmbByteRange(start, resourceLength - 1L))
+        }
+        val start = first.toLongOrNull() ?: return SmbRangeResult.Malformed
+        if (start < 0L || start >= resourceLength) return SmbRangeResult.Unsatisfiable
+        val requestedEnd = if (second.isEmpty()) {
+            resourceLength - 1L
+        } else {
+            second.toLongOrNull() ?: return SmbRangeResult.Malformed
+        }
+        if (requestedEnd < start) return SmbRangeResult.Unsatisfiable
+        return SmbRangeResult.Satisfied(
+            SmbByteRange(start, requestedEnd.coerceAtMost(resourceLength - 1L)),
+        )
+    }
 
-        override fun createDataSource(): SmbDataSource = SmbDataSource(
-            profiles = profiles,
-            maxReadChunkBytes = maxReadChunkBytes,
-            readAheadBytes = readAheadBytes,
-        ).also { source -> transferListener?.let(source::addTransferListener) }
+    fun responsePolicy(result: SmbRangeResult, resourceLength: Long): SmbRangeResponse {
+        require(resourceLength >= 0L) { "Resource length must not be negative" }
+        return when (result) {
+            SmbRangeResult.Absent -> SmbRangeResponse(200, resourceLength)
+            is SmbRangeResult.Satisfied -> SmbRangeResponse(
+                status = 206,
+                contentLength = result.range.length,
+                contentRange = "bytes ${result.range.start}-${result.range.endInclusive}/$resourceLength",
+            )
+            SmbRangeResult.Unsatisfiable,
+            SmbRangeResult.Malformed,
+            -> SmbRangeResponse(
+                status = 416,
+                contentLength = 0L,
+                contentRange = "bytes */$resourceLength",
+            )
+        }
+    }
+
+    fun statusLine(status: Int): String = when (status) {
+        200 -> "200 OK"
+        206 -> "206 Partial Content"
+        400 -> "400 Bad Request"
+        404 -> "404 Not Found"
+        405 -> "405 Method Not Allowed"
+        416 -> "416 Range Not Satisfiable"
+        else -> "$status"
+    }
+}
+
+/**
+ * A random-access reader over one SMB file. Every network request is bounded by [maxChunkBytes]
+ * and uses SMBJ's positional read API, so seeks never drain bytes from offset zero. A failed
+ * request gets exactly one reconnect-and-retry; close() prevents reconnecting a cancelled read.
+ */
+internal class SmbRandomAccessReader(
+    private val handle: SmbFileHandle,
+    val length: Long,
+    private val maxChunkBytes: Int = DEFAULT_MAX_READ_CHUNK_BYTES,
+) : Closeable {
+    private val closed = AtomicBoolean(false)
+    private val ioLock = Any()
+
+    init {
+        require(maxChunkBytes in MIN_READ_CHUNK_BYTES..MAX_READ_CHUNK_BYTES) {
+            "SMB read chunk must be between $MIN_READ_CHUNK_BYTES and $MAX_READ_CHUNK_BYTES bytes"
+        }
+        require(length >= 0L) { "SMB file length must not be negative" }
+    }
+
+    fun readAt(buffer: ByteArray, offset: Int, requestedLength: Int, position: Long): Int {
+        if (offset < 0 || requestedLength < 0 || offset > buffer.size - requestedLength) {
+            throw IndexOutOfBoundsException("Invalid SMB read buffer range")
+        }
+        if (requestedLength == 0) return 0
+        if (position < 0L) throw IOException("SMB read position must not be negative")
+        if (position >= length) return -1
+        if (closed.get()) throw IOException("SMB reader is closed")
+        val available = length - position
+        val request = minOf(requestedLength.toLong(), available, maxChunkBytes.toLong()).toInt()
+        if (request <= 0) return -1
+        synchronized(ioLock) {
+            if (closed.get()) throw IOException("SMB reader is closed")
+            return try {
+                readOnce(buffer, offset, request, position)
+            } catch (error: Exception) {
+                if (closed.get()) throw IOException("SMB reader is closed", error)
+                try {
+                    handle.reconnect()
+                    readOnce(buffer, offset, request, position)
+                } catch (retryError: Exception) {
+                    if (closed.get()) throw IOException("SMB reader is closed", retryError)
+                    if (retryError is IOException) throw retryError
+                    throw IOException("Unable to read SMB media", retryError)
+                }
+            }
+        }
+    }
+
+    private fun readOnce(buffer: ByteArray, offset: Int, request: Int, position: Long): Int {
+        val count = handle.read(buffer, offset, request, position)
+        if (count <= 0) throw IOException("SMB server returned an empty read")
+        if (count > request) throw IOException("SMB server returned more bytes than requested")
+        return count
+    }
+
+    override fun close() {
+        if (closed.compareAndSet(false, true)) handle.close()
     }
 
     companion object {
         /** Default upper bound per SMB READ request (SMBJ further caps to its negotiated size). */
         const val DEFAULT_MAX_READ_CHUNK_BYTES = 8 * 1024 * 1024
-        /** Default bounded window used to coalesce Media3's small sequential reads. */
-        const val DEFAULT_READ_AHEAD_BYTES = 2 * 1024 * 1024
         const val MIN_READ_CHUNK_BYTES = 4 * 1024
         const val MAX_READ_CHUNK_BYTES = 8 * 1024 * 1024
-        const val MAX_READ_AHEAD_BYTES = MAX_READ_CHUNK_BYTES
+    }
+}
+
+private class SmbSequentialInputStream(
+    private val reader: SmbRandomAccessReader,
+    private val readAheadBytes: Int = DEFAULT_READ_AHEAD_BYTES,
+) : InputStream() {
+    private val closed = AtomicBoolean(false)
+    private var position = 0L
+    private var window: ByteArray? = null
+    private var windowOffset = 0
+    private var windowLength = 0
+
+    init {
+        require(readAheadBytes in SmbRandomAccessReader.MIN_READ_CHUNK_BYTES..SmbRandomAccessReader.MAX_READ_CHUNK_BYTES)
     }
 
-    private enum class TransferState {
-        NONE,
-        STARTING,
-        STARTED,
+    override fun read(): Int {
+        val one = ByteArray(1)
+        val count = read(one, 0, 1)
+        return if (count < 0) -1 else one[0].toInt() and 0xff
+    }
+
+    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+        if (offset < 0 || length < 0 || offset > buffer.size - length) {
+            throw IndexOutOfBoundsException("Invalid SMB stream buffer range")
+        }
+        if (length == 0) return 0
+        if (closed.get()) throw IOException("SMB stream is closed")
+
+        var copied = 0
+        val available = windowLength
+        if (available > 0) {
+            val source = window ?: throw IOException("SMB read-ahead buffer is missing")
+            copied = minOf(length, available)
+            System.arraycopy(source, windowOffset, buffer, offset, copied)
+            windowOffset += copied
+            windowLength -= copied
+            position += copied
+            if (windowLength == 0) windowOffset = 0
+            if (copied == length) return copied
+        }
+
+        val requested = length - copied
+        val capacity = SmbReadAheadPolicy.effectiveCapacity(readAheadBytes, SmbRandomAccessReader.DEFAULT_MAX_READ_CHUNK_BYTES)
+        val shouldPrefetch = SmbReadAheadPolicy.shouldReadAhead(requested, capacity)
+        if (shouldPrefetch) {
+            val target = window ?: ByteArray(capacity).also { window = it }
+            val count = reader.readAt(
+                target,
+                0,
+                SmbReadAheadPolicy.prefetchLength(
+                    remainingBytes = reader.length - position,
+                    capacityBytes = capacity,
+                    maxChunkBytes = SmbRandomAccessReader.DEFAULT_MAX_READ_CHUNK_BYTES,
+                ),
+                position,
+            )
+            if (count < 0) return if (copied == 0) -1 else copied
+            windowOffset = 0
+            windowLength = count
+            val deliver = minOf(requested, count)
+            System.arraycopy(target, 0, buffer, offset + copied, deliver)
+            windowOffset = deliver
+            windowLength -= deliver
+            position += deliver
+            return copied + deliver
+        }
+
+        val count = reader.readAt(buffer, offset + copied, requested, position)
+        if (count < 0) return if (copied == 0) -1 else copied
+        position += count
+        return copied + count
+    }
+
+    override fun skip(byteCount: Long): Long {
+        if (byteCount <= 0L) return 0L
+        if (closed.get()) throw IOException("SMB stream is closed")
+        val skipped = minOf(byteCount, reader.length - position).coerceAtLeast(0L)
+        position += skipped
+        windowOffset = 0
+        windowLength = 0
+        return skipped
+    }
+
+    override fun available(): Int {
+        if (closed.get()) return 0
+        return minOf(reader.length - position, Int.MAX_VALUE.toLong()).coerceAtLeast(0L).toInt()
+    }
+
+    override fun close() {
+        if (closed.compareAndSet(false, true)) reader.close()
+    }
+
+    companion object {
+        const val DEFAULT_READ_AHEAD_BYTES = 2 * 1024 * 1024
+    }
+}
+
+private class SmbSourceLease(
+    private val reader: SmbRandomAccessReader,
+    private val server: SmbLoopbackRangeServer,
+) : Closeable {
+    private val closed = AtomicBoolean(false)
+
+    override fun close() {
+        if (!closed.compareAndSet(false, true)) return
+        server.close()
+        reader.close()
     }
 }
 
 /**
- * Selects SMB for [SmbUri.SCHEME] and preserves Media3's normal routing for every other scheme.
- * This factory can be passed to ExoPlayer's [androidx.media3.exoplayer.source.DefaultMediaSourceFactory]
- * without changing content/file/http playback behavior.
+ * Minimal API-23-compatible loopback HTTP server. It intentionally handles only HEAD and GET,
+ * one tokenized path, and one byte range per request. A dedicated server per source means closing
+ * the source immediately releases both the listening socket and its SMB lease.
  */
-@SuppressLint("UnsafeOptInUsageError")
-class SmbRoutingDataSourceFactory(
-    context: android.content.Context,
-    profiles: SmbConnectionProfileRegistry,
-    private val fallbackFactory: DataSource.Factory = DefaultDataSource.Factory(context),
-    maxReadChunkBytes: Int = SmbDataSource.DEFAULT_MAX_READ_CHUNK_BYTES,
-    readAheadBytes: Int = SmbDataSource.DEFAULT_READ_AHEAD_BYTES,
-) : DataSource.Factory {
-    private val smbFactory = SmbDataSource.Factory(profiles, maxReadChunkBytes, readAheadBytes)
-    private var transferListener: TransferListener? = null
-
-    fun setTransferListener(listener: TransferListener?): SmbRoutingDataSourceFactory = apply {
-        transferListener = listener
+private class SmbLoopbackRangeServer(
+    private val reader: SmbRandomAccessReader,
+) : Closeable {
+    private val closed = AtomicBoolean(false)
+    private val token = UUID.randomUUID().toString().replace("-", "")
+    private val socket = ServerSocket().apply {
+        reuseAddress = true
+        bind(InetSocketAddress("127.0.0.1", 0), 16)
+    }
+    private val workers = Executors.newCachedThreadPool(SmbThreadFactory(token))
+    private val acceptThread = Thread({ acceptLoop() }, "smb-http-accept-$token").apply {
+        isDaemon = true
     }
 
-    override fun createDataSource(): DataSource = RoutingDataSource(
-        fallbackFactory = fallbackFactory,
-        smbFactory = smbFactory,
-    ).also { source -> transferListener?.let(source::addTransferListener) }
-}
+    val location: String
+        get() = "http://127.0.0.1:${socket.localPort}/$token"
 
-@SuppressLint("UnsafeOptInUsageError")
-private class RoutingDataSource(
-    private val fallbackFactory: DataSource.Factory,
-    private val smbFactory: DataSource.Factory,
-) : DataSource {
-    private val listeners = mutableListOf<TransferListener>()
-    private var active: DataSource? = null
-
-    override fun addTransferListener(transferListener: TransferListener) {
-        synchronized(listeners) {
-            if (!listeners.contains(transferListener)) listeners += transferListener
-        }
-        active?.addTransferListener(transferListener)
+    fun start() {
+        acceptThread.start()
     }
 
-    override fun open(dataSpec: DataSpec): Long {
-        close()
-        val selected = if (SmbUri.isSmbUri(dataSpec.uri)) {
-            smbFactory.createDataSource()
-        } else {
-            fallbackFactory.createDataSource()
-        }
-        synchronized(listeners) { listeners.forEach(selected::addTransferListener) }
-        active = selected
-        return try {
-            selected.open(dataSpec)
-        } catch (error: IOException) {
-            active = null
-            selected.close()
-            throw error
-        } catch (error: Exception) {
-            active = null
-            selected.close()
-            throw error
+    private fun acceptLoop() {
+        while (!closed.get()) {
+            try {
+                val client = socket.accept()
+                if (closed.get()) {
+                    client.close()
+                } else {
+                    workers.execute { handle(client) }
+                }
+            } catch (_: SocketException) {
+                if (closed.get()) return
+            } catch (_: IOException) {
+                if (closed.get()) return
+            }
         }
     }
 
-    override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
-        active?.read(buffer, offset, length) ?: throw IOException("Data source is not open")
+    private fun handle(client: Socket) {
+        client.use { socket ->
+            runCatching { socket.soTimeout = 15_000 }
+            val input = BufferedReader(InputStreamReader(socket.getInputStream(), HTTP_CHARSET))
+            val output = socket.getOutputStream()
+            val requestLine = input.readLine() ?: return
+            val parts = requestLine.split(' ', limit = 3)
+            if (parts.size != 3) {
+                sendError(output, 400)
+                return
+            }
+            val method = parts[0].uppercase(Locale.US)
+            val target = parts[1]
+            val headers = LinkedHashMap<String, String>()
+            while (true) {
+                val line = input.readLine() ?: return
+                if (line.isEmpty()) break
+                val separator = line.indexOf(':')
+                if (separator <= 0) {
+                    sendError(output, 400)
+                    return
+                }
+                val name = line.substring(0, separator).trim().lowercase(Locale.US)
+                if (name.length > 128) {
+                    sendError(output, 400)
+                    return
+                }
+                headers[name] = line.substring(separator + 1).trim()
+            }
 
-    override fun getUri(): Uri? = active?.uri
+            // A URI fragment is never sent over HTTP. Rejecting all query strings ensures a
+            // caller cannot smuggle a second token or credentials into the path.
+            if (target != "/$token") {
+                sendError(output, 404)
+                return
+            }
+            if (method != "GET" && method != "HEAD") {
+                output.write(responseHeaders(405, mapOf(
+                    "Allow" to "GET, HEAD",
+                    "Content-Length" to "0",
+                )).toByteArray(HTTP_CHARSET))
+                output.flush()
+                return
+            }
 
-    override fun getResponseHeaders(): Map<String, List<String>> = active?.responseHeaders.orEmpty()
+            val parsedRange = SmbRangeProtocol.parseRangeHeader(headers["range"], reader.length)
+            val response = SmbRangeProtocol.responsePolicy(parsedRange, reader.length)
+            val extra = linkedMapOf<String, String>().apply {
+                put("Accept-Ranges", "bytes")
+                put("Content-Length", response.contentLength.toString())
+                response.contentRange?.let { put("Content-Range", it) }
+            }
+            output.write(responseHeaders(response.status, extra).toByteArray(HTTP_CHARSET))
+            if (method == "GET" && response.status != 416) {
+                val selected = (parsedRange as? SmbRangeResult.Satisfied)?.range
+                    ?: if (reader.length == 0L) null else SmbByteRange(0L, reader.length - 1L)
+                selected?.let { stream(output, it, it.length) }
+            }
+            output.flush()
+        }
+    }
+
+    private fun stream(output: OutputStream, range: SmbByteRange, expectedLength: Long) {
+        var position = range.start
+        var remaining = expectedLength
+        val buffer = ByteArray(64 * 1024)
+        while (remaining > 0L) {
+            val request = minOf(remaining, buffer.size.toLong()).toInt()
+            val count = reader.readAt(buffer, 0, request, position)
+            if (count <= 0) throw IOException("SMB source ended before the requested range")
+            output.write(buffer, 0, count)
+            position += count
+            remaining -= count
+        }
+    }
+
+    private fun sendError(output: OutputStream, status: Int) {
+        output.write(responseHeaders(status, mapOf("Content-Length" to "0")).toByteArray(HTTP_CHARSET))
+        output.flush()
+    }
+
+    private fun responseHeaders(status: Int, extra: Map<String, String>): String = buildString {
+        append("HTTP/1.1 ").append(SmbRangeProtocol.statusLine(status)).append("\r\n")
+        append("Connection: close\r\n")
+        extra.forEach { (name, value) -> append(name).append(": ").append(value).append("\r\n") }
+        append("\r\n")
+    }
 
     override fun close() {
-        val source = active
-        active = null
-        source?.close()
+        if (!closed.compareAndSet(false, true)) return
+        runCatching { socket.close() }
+        workers.shutdownNow()
+    }
+
+    private class SmbThreadFactory(private val token: String) : ThreadFactory {
+        override fun newThread(runnable: Runnable): Thread = Thread(runnable, "smb-http-worker-$token").apply {
+            isDaemon = true
+        }
+    }
+
+    companion object {
+        private val HTTP_CHARSET: Charset = StandardCharsets.ISO_8859_1
     }
 }
 
 /** One open SMB file with reconnect-once semantics and no URI/credential logging. */
-private class SmbFileHandle(
+internal class SmbFileHandle(
     private val profile: SmbConnectionProfile,
     private val location: SmbLocation,
 ) : Closeable {

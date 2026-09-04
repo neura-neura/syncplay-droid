@@ -14,10 +14,6 @@ import androidx.compose.ui.test.performScrollTo
 import dev.neura.syncplay.protocol.ConnectionConfig
 import dev.neura.syncplay.protocol.ConnectionStatus
 import dev.neura.syncplay.protocol.MediaDescriptor
-import dev.neura.syncplay.player.PlaybackEngine
-import dev.neura.syncplay.player.PlaybackEnginePreference
-import dev.neura.syncplay.player.PlaybackEngineReason
-import dev.neura.syncplay.player.PlaybackEngineState
 import dev.neura.syncplay.ui.theme.SyncplayTheme
 import org.junit.Assert.assertEquals
 import org.junit.Rule
@@ -161,8 +157,7 @@ class ExpressiveScreensTest {
     }
 
     @Test
-    fun playbackEngineDialogExplainsAutomaticCompatibilityAndAllowsOverride() {
-        var selected: PlaybackEnginePreference? = null
+    fun playbackDiagnosticsIdentifyMpvAsTheSingleBackend() {
         composeRule.setContent {
             SyncplayTheme {
                 PlayerRoomScreen(
@@ -175,11 +170,6 @@ class ExpressiveScreensTest {
                         isInRoom = true,
                         effectiveUsername = "android-user",
                         effectiveRoom = "movies",
-                        playbackEngine = PlaybackEngineState(
-                            preference = PlaybackEnginePreference.AUTOMATIC,
-                            active = PlaybackEngine.MPV,
-                            reason = PlaybackEngineReason.MATROSKA_COMPATIBILITY,
-                        ),
                     ),
                     onOpenFile = {},
                     onOpenUrl = {},
@@ -189,19 +179,69 @@ class ExpressiveScreensTest {
                     onChangeRoom = {},
                     onDisconnect = {},
                     onDismissPlaybackError = {},
-                    onSetPlaybackEngine = { selected = it },
                 )
             }
         }
 
         composeRule.onNodeWithContentDescription("Más opciones").performClick()
-        composeRule.onNodeWithText("Motor de reproducción").performClick()
-        composeRule.onNodeWithText("Motor activo: MPV").assertIsDisplayed()
-        composeRule.onNodeWithText("Automático (recomendado)").assertIsDisplayed()
-        composeRule.onNodeWithText("AndroidX Media3").performClick()
+        composeRule.onNodeWithText("Diagnóstico de reproducción").performClick()
+        composeRule.onNodeWithText("MPV · único motor de reproducción").assertIsDisplayed()
+    }
 
-        composeRule.runOnIdle {
-            assertEquals(PlaybackEnginePreference.MEDIA3, selected)
+    @Test
+    fun subtitleCustomizationExposesNoirAppearanceAndTimingControls() {
+        composeRule.setContent {
+            SyncplayTheme {
+                PlayerRoomScreen(
+                    state = SyncplayUiState(
+                        connectionStatus = ConnectionStatus.Connected(
+                            endpoint = "192.0.2.65:8999",
+                            secure = false,
+                            serverVersion = "1.7.4",
+                        ),
+                        isInRoom = true,
+                        effectiveUsername = "android-user",
+                        effectiveRoom = "movies",
+                        media = MediaDescriptor("Movie.mkv", 7_000.0, 8_000_000_000L),
+                        subtitleTracks = listOf(
+                            SubtitleTrackUi(
+                                id = "subtitle:1:0",
+                                label = "episode.ass",
+                                isSelected = true,
+                                isExternal = true,
+                                isText = true,
+                            ),
+                        ),
+                        installedSubtitleFonts = listOf("sans-serif", "serif"),
+                    ),
+                    onOpenFile = {},
+                    onOpenUrl = {},
+                    onOpenSubtitle = {},
+                    onToggleReady = {},
+                    onSendChat = { true },
+                    onChangeRoom = {},
+                    onDisconnect = {},
+                    onDismissPlaybackError = {},
+                )
+            }
         }
+
+        composeRule.onNodeWithContentDescription("Más opciones").performClick()
+        composeRule.onNodeWithText("Personalizar subtítulos").performClick()
+        composeRule.onNodeWithText("Apariencia de subtítulos").assertIsDisplayed()
+        composeRule.onNodeWithText("Buscar fuentes instaladas").assertIsDisplayed()
+        composeRule.onNodeWithText("Color del texto").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("Tamaño de fuente").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("Avanzado").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("Mostrar").performClick()
+        // The editor is a regular scrollable Column (not lazy), so every option must remain in
+        // the semantics tree even when it is below the current viewport.
+        composeRule.onAllNodesWithText("Peso de fuente").assertCountEquals(1)
+        composeRule.onAllNodesWithText("Espaciado de letras").assertCountEquals(1)
+        composeRule.onAllNodesWithText("Desfase de subtítulos").assertCountEquals(1)
+        composeRule.onAllNodesWithText("Recordar desfase").assertCountEquals(1)
+        composeRule.onAllNodesWithText("Anterior aquí").assertCountEquals(1)
+        composeRule.onAllNodesWithText("Siguiente aquí").assertCountEquals(1)
+        composeRule.onAllNodesWithText("Descargar ajustados").assertCountEquals(1)
     }
 }

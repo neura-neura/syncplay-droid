@@ -1,41 +1,37 @@
 package dev.neura.syncplay.ui
 
 import android.app.Application
-import android.annotation.SuppressLint
 import android.content.ComponentName
 import android.content.ContentResolver
+import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.net.Uri
-import android.os.Bundle
-import androidx.core.content.ContextCompat
+import android.os.IBinder
 import androidx.core.net.toUri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import androidx.media3.common.C
-import androidx.media3.common.MediaItem
-import androidx.media3.common.MediaMetadata
-import androidx.media3.common.MimeTypes
-import androidx.media3.common.PlaybackException
-import androidx.media3.common.Player
-import androidx.media3.common.Tracks
-import androidx.media3.session.MediaController
-import androidx.media3.session.SessionToken
 import dev.neura.syncplay.data.SettingsRepository
+import dev.neura.syncplay.data.SubtitlePreferencesRepository
 import dev.neura.syncplay.player.LocalPlaybackChangeReason
 import dev.neura.syncplay.player.LocalPlaybackEvent
 import dev.neura.syncplay.player.MediaInfoResolver
-import dev.neura.syncplay.player.PlaybackService
 import dev.neura.syncplay.player.PlaybackDiagnosticsStore
-import dev.neura.syncplay.player.PlaybackEngine
-import dev.neura.syncplay.player.PlaybackEnginePreference
-import dev.neura.syncplay.player.PlaybackEngineReason
-import dev.neura.syncplay.player.PlaybackEngineStore
+import dev.neura.syncplay.player.PlaybackService
 import dev.neura.syncplay.player.PlaybackSynchronizer
 import dev.neura.syncplay.player.RemoteApplyResult
 import dev.neura.syncplay.player.ResolvedMediaInfo
 import dev.neura.syncplay.player.SourceAccessClassification
 import dev.neura.syncplay.player.isEffectivelyPaused
-import dev.neura.syncplay.player.selectPlaybackEngine
+import dev.neura.syncplay.player.mpv.MpvEventOrigin
+import dev.neura.syncplay.player.mpv.MpvExternalSubtitle
+import dev.neura.syncplay.player.mpv.MpvPlaybackPhase
+import dev.neura.syncplay.player.mpv.MpvPlaybackSession
+import dev.neura.syncplay.player.mpv.MpvPlaybackSnapshot
+import dev.neura.syncplay.player.mpv.MpvTrackInfo
+import dev.neura.syncplay.player.mpv.MpvTrackMapper
+import dev.neura.syncplay.player.mpv.MpvTrackType
+import dev.neura.syncplay.player.mpv.isBitmapSubtitle
 import dev.neura.syncplay.protocol.ChatEntry
 import dev.neura.syncplay.protocol.ConnectionConfig
 import dev.neura.syncplay.protocol.ConnectionStatus
@@ -44,12 +40,24 @@ import dev.neura.syncplay.protocol.ProtocolEvent
 import dev.neura.syncplay.protocol.RoomUser
 import dev.neura.syncplay.protocol.SyncplayConnection
 import dev.neura.syncplay.protocol.parseServerEndpoint
-import kotlinx.coroutines.CoroutineStart
+import dev.neura.syncplay.smb.SmbPlaybackEnvironment
+import dev.neura.syncplay.smb.SmbUri
+import dev.neura.syncplay.ui.subtitle.SubtitleAppearance
+import dev.neura.syncplay.ui.subtitle.SubtitlePreferences
+import dev.neura.syncplay.ui.subtitle.SubtitleExport
+import dev.neura.syncplay.ui.subtitle.SubtitleSyncSettings
+import dev.neura.syncplay.ui.subtitle.SystemSubtitleFontCatalog
+import dev.neura.syncplay.ui.subtitle.toMpvProperties
+import java.util.UUID
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import kotlin.math.abs
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -57,66 +65,63 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.util.UUID
-import kotlin.math.abs
 
-class SyncplayViewModel(
-    application: Application,
-) : AndroidViewModel(application) {
-    @SuppressLint("StaticFieldLeak")
+/** Screen state holder and protocol coordinator for the single MPV playback session. */
+class SyncplayViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application.applicationContext
     private val settings = SettingsRepository(app)
+    private val subtitleSettings = SubtitlePreferencesRepository(app)
     private val connection = SyncplayConnection()
     private val synchronizer = PlaybackSynchronizer(scope = viewModelScope)
-
     private val _uiState = MutableStateFlow(SyncplayUiState())
     val uiState: StateFlow<SyncplayUiState> = _uiState.asStateFlow()
 
-    private val controllerFutures = ControllerFutureLifecycle(MediaController::releaseFuture)
+    private var player: MpvPlaybackSession? = null
+    private var playerStateJob: Job? = null
     private var protocolEventsJob: Job? = null
     private var mediaLoadJob: Job? = null
-    private var mediaRehydrationJob: Job? = null
     private var subtitleLoadJob: Job? = null
-    private var subtitleSelectionTimeoutJob: Job? = null
-    private var controller: MediaController? = null
+    private var subtitleTimeoutJob: Job? = null
     private var currentMediaInfo: ResolvedMediaInfo? = null
     private var currentMediaUri: Uri? = null
     private var currentSubtitleUri: Uri? = null
+    private var currentSubtitleDisplayName: String? = null
+    private var pendingMedia: ResolvedMediaInfo? = null
     private var pendingMediaGrantUri: Uri? = null
     private var pendingSubtitleGrantUri: Uri? = null
-    private var subtitleConfigurations: List<MediaItem.SubtitleConfiguration> = emptyList()
     private var desiredExternalSubtitleId: String? = null
-    private val subtitleSelectionGate = SubtitleSelectionGate()
     private var mediaLoadGeneration = 0L
-    // Recover grants acquired by an earlier ViewModel/process instance. They are released only
-    // after Media3 has accepted a newer active selection, never merely because the UI recreated.
+    private val subtitleSelectionGate = SubtitleSelectionGate()
+    private var lastSentDescriptor: MediaDescriptor? = null
+    private var chatSequence = 0L
+    private var passwordServerHost: String? = null
+    private var serviceBound = false
+    private var appliedNativeSubtitleVisibility: Boolean? = null
+    private var subtitlePreferencesLoaded = false
+
     private val persistedSelectionUris = runCatching {
-        app.contentResolver.persistedUriPermissions
-            .asSequence()
+        app.contentResolver.persistedUriPermissions.asSequence()
             .filter { it.isReadPermission }
             .map { it.uri }
             .toCollection(linkedSetOf())
     }.getOrDefault(linkedSetOf())
-    private var pendingMedia: ResolvedMediaInfo? = null
-    private var lastSentDescriptor: MediaDescriptor? = null
-    private var chatSequence = 0L
-    private var passwordServerHost: String? = null
 
-    private val playerListener = object : Player.Listener {
-        override fun onPlayerError(error: PlaybackException) {
-            desiredExternalSubtitleId = null
-            subtitleSelectionTimeoutJob?.cancel()
-            subtitleSelectionTimeoutJob = null
-            _uiState.update {
-                it.copy(
-                    isSubtitleLoading = false,
-                    playback = it.playback.copy(error = friendlyPlaybackError(error.errorCode)),
-                )
-            }
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            val session = (binder as? PlaybackService.LocalBinder)?.playbackSession ?: return
+            serviceBound = true
+            attachPlayer(session)
         }
 
-        override fun onTracksChanged(tracks: Tracks) {
-            handleSubtitleTracksChanged(tracks)
+        override fun onServiceDisconnected(name: ComponentName?) {
+            serviceBound = false
+            detachPlayer()
+        }
+
+        override fun onBindingDied(name: ComponentName?) {
+            serviceBound = false
+            detachPlayer()
+            bindPlaybackService()
         }
     }
 
@@ -124,66 +129,47 @@ class SyncplayViewModel(
         connection.setLocalStateProvider { synchronizer.localState.value }
         connection.setRemoteStateApplier { remote ->
             withContext(Dispatchers.Main.immediate) {
-                // MediaController commands run on this looper. Apply the seek directly so the
-                // acknowledgement cannot race a queued Service intent or land on a newer item.
                 synchronizer.applyRemoteState(remote)
                 synchronizer.snapshot()
             }
         }
         synchronizer.onLocalPlaybackEvent = ::handleLocalPlaybackEvent
         synchronizer.onRemoteApplied = ::handleRemoteApplied
-        synchronizer.onRemoteSeekRequested = { positionMs ->
-            PlaybackService.seekToSynchronizedNow(currentMediaUri?.toString(), positionMs)
-        }
 
         viewModelScope.launch {
-            val saved = try {
-                settings.connectionConfig.first()
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (_: Exception) {
-                // SettingsRepository already converts DataStore read failures to an empty
-                // configuration. Keep this boundary defensive so a provider/keystore failure
-                // can never leave the connection screen's Loading state stuck forever.
-                ConnectionConfig()
-            }
-            passwordServerHost = saved.password.takeIf { it.isNotBlank() }
+            val saved = runCatching { settings.connectionConfig.first() }
+                .getOrElse { error ->
+                    if (error is CancellationException) throw error
+                    ConnectionConfig()
+                }
+            passwordServerHost = saved.password.takeIf(String::isNotBlank)
                 ?.let { parsedServerHost(saved.serverAddress) }
             _uiState.update { it.copy(form = saved, settingsLoaded = true) }
         }
         viewModelScope.launch {
-            connection.status.collect { status ->
-                _uiState.update { current ->
-                    val leftSession = status is ConnectionStatus.Disconnected || status is ConnectionStatus.Error
-                    current.copy(
-                        connectionStatus = status,
-                        isInRoom = if (leftSession) false else current.isInRoom,
-                        users = if (leftSession) emptyList() else current.users,
-                    )
+            subtitleSettings.preferences.collect { stored ->
+                val currentSync = _uiState.value.subtitlePreferences.sync
+                val effectiveSync = when {
+                    stored.sync.rememberOffset -> stored.sync
+                    subtitlePreferencesLoaded && !currentSync.rememberOffset -> currentSync
+                    else -> stored.sync.copy(offsetMs = 0L)
                 }
+                val effective = stored.copy(sync = effectiveSync)
+                subtitlePreferencesLoaded = true
+                _uiState.update { it.copy(subtitlePreferences = effective) }
+                applySubtitlePreferences(effective)
             }
         }
         viewModelScope.launch {
-            synchronizer.progress.collect { progress ->
-                if (progress == null) return@collect
-                if (!isProgressForMedia(progress.mediaIdentity, currentMediaUri?.toString())) return@collect
-                val duration = progress.durationMs.takeIf { it != C.TIME_UNSET && it > 0L } ?: 0L
+            connection.status.collect { status ->
                 _uiState.update { current ->
+                    val left = status is ConnectionStatus.Disconnected || status is ConnectionStatus.Error
                     current.copy(
-                        playback = current.playback.copy(
-                            positionMs = progress.positionMs,
-                            durationMs = duration,
-                            paused = isEffectivelyPaused(
-                                playWhenReady = progress.playWhenReady,
-                                playbackState = progress.playbackState,
-                                hasPlayerError = current.playback.error != null,
-                            ),
-                            isReady = progress.playbackState == Player.STATE_READY,
-                            speed = current.player?.playbackParameters?.speed ?: 1f,
-                        ),
+                        connectionStatus = status,
+                        isInRoom = if (left) false else current.isInRoom,
+                        users = if (left) emptyList() else current.users,
                     )
                 }
-                updateDurationAndBroadcast(duration)
             }
         }
         viewModelScope.launch {
@@ -191,20 +177,54 @@ class SyncplayViewModel(
                 _uiState.update { it.copy(playbackDiagnostics = diagnostics) }
             }
         }
-        viewModelScope.launch {
-            PlaybackEngineStore.state.collect { engine ->
-                _uiState.update { it.copy(playbackEngine = engine) }
-            }
+        PlaybackService.ensureStarted(app)
+        bindPlaybackService()
+        RemoteSubtitleFontLoader.savedCssUrl(app).takeIf(String::isNotBlank)?.let { savedUrl ->
+            loadRemoteSubtitleFont(savedUrl, reportFailure = false)
         }
+        viewModelScope.launch {
+            val fonts = withContext(Dispatchers.IO) { SystemSubtitleFontCatalog.load() }
+            _uiState.update { it.copy(installedSubtitleFonts = fonts) }
+        }
+    }
 
-        connectMediaController()
+    private fun bindPlaybackService() {
+        if (serviceBound) return
+        runCatching {
+            app.bindService(Intent(app, PlaybackService::class.java), serviceConnection, Context.BIND_AUTO_CREATE)
+        }.onSuccess { serviceBound = it }
+    }
+
+    private fun attachPlayer(session: MpvPlaybackSession) {
+        if (player === session) return
+        detachPlayer()
+        player = session
+        synchronizer.attach(session)
+        _uiState.update { it.copy(playerAvailable = true) }
+        applySubtitlePreferences(_uiState.value.subtitlePreferences)
+        restoreSessionState(session.snapshot.value)
+        playerStateJob = viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            session.snapshot.collect(::handlePlayerSnapshot)
+        }
+        pendingMedia?.let { info ->
+            pendingMedia = null
+            installMediaOnPlayer(info)
+        }
+    }
+
+    private fun detachPlayer() {
+        playerStateJob?.cancel()
+        playerStateJob = null
+        synchronizer.detach()
+        player = null
+        _uiState.update { it.copy(playerAvailable = false) }
     }
 
     fun updateConnectionForm(config: ConnectionConfig) {
         _uiState.update { current ->
             val passwordEdited = config.password != current.form.password
             if (passwordEdited) {
-                passwordServerHost = config.password.takeIf { it.isNotBlank() }
+                passwordServerHost = config.password.takeIf(String::isNotBlank)
                     ?.let { parsedServerHost(config.serverAddress) }
             } else if (current.form.password.isNotBlank() && passwordServerHost == null) {
                 passwordServerHost = parsedServerHost(current.form.serverAddress)
@@ -254,20 +274,18 @@ class SyncplayViewModel(
         }
         persistConnection(savedConfig)
         restartProtocolEventCollection()
-        runCatching { connection.connect(config) }
-            .onFailure { error ->
-                protocolEventsJob?.cancel()
-                protocolEventsJob = null
-                _uiState.update { it.copy(formError = error.message) }
-            }
+        runCatching { connection.connect(config) }.onFailure { error ->
+            protocolEventsJob?.cancel()
+            protocolEventsJob = null
+            _uiState.update { it.copy(formError = error.message) }
+        }
     }
 
     fun disconnect() {
         protocolEventsJob?.cancel()
         protocolEventsJob = null
         connection.disconnect()
-        // Pause locally only after detaching from Syncplay so leaving a room never pauses peers.
-        controller?.pause()
+        player?.pause(MpvEventOrigin.SYSTEM)
         _uiState.update {
             it.copy(
                 isInRoom = false,
@@ -283,17 +301,13 @@ class SyncplayViewModel(
     }
 
     fun toggleReady() {
-        val newValue = !_uiState.value.localReady
-        if (connection.sendReady(newValue)) {
-            _uiState.update { it.copy(localReady = newValue) }
-        }
+        val value = !_uiState.value.localReady
+        if (connection.sendReady(value)) _uiState.update { it.copy(localReady = value) }
     }
 
     fun sendChat(text: String): Boolean {
         val maximum = (_uiState.value.serverFeatures["maxChatMessageLength"] as? Number)
-            ?.toInt()
-            ?.coerceAtLeast(1)
-            ?: 500
+            ?.toInt()?.coerceAtLeast(1) ?: 500
         val message = text.trim().take(maximum)
         return message.isNotEmpty() && connection.sendChat(message)
     }
@@ -302,59 +316,46 @@ class SyncplayViewModel(
         val normalized = room.trim()
         if (normalized.isEmpty() || normalized == _uiState.value.effectiveRoom) return
         connection.changeRoom(normalized)
-        val publicRoomName = roomWithoutControllerPassword(normalized)
+        val publicRoom = roomWithoutControllerPassword(normalized)
         _uiState.update {
             it.copy(
-                effectiveRoom = publicRoomName,
+                effectiveRoom = publicRoom,
                 users = emptyList(),
                 chat = emptyList(),
                 sharedPlaylist = emptyList(),
                 sharedPlaylistIndex = null,
-                form = it.form.copy(room = publicRoomName),
+                form = it.form.copy(room = publicRoom),
             )
         }
         persistConnection(_uiState.value.form)
     }
 
     fun openMedia(uri: Uri, grantFlags: Int = Intent.FLAG_GRANT_READ_URI_PERMISSION) {
-        val loadGeneration = beginMediaSelection()
-        // Track the current selection even when the provider only grants
-        // transient access. This also protects a same-URI replacement from a
-        // stale request releasing a previously persisted grant.
+        val generation = beginMediaSelection()
         pendingMediaGrantUri = uri
-        if (!takeReadPermission(uri, grantFlags)) {
-            PlaybackService.retainReadGrant(app, uri)
-        }
+        if (!takeReadPermission(uri, grantFlags)) PlaybackService.retainReadGrant(app, uri)
         mediaLoadJob = viewModelScope.launch {
             try {
                 val info = withContext(Dispatchers.IO) { MediaInfoResolver.resolve(app, uri) }
-                // A provider read may not be interruptible.  Do not let a
-                // cancelled, stale load replace a newer selection when it
-                // eventually returns.
                 ensureActive()
-                if (!isCurrentMediaLoad(loadGeneration, mediaLoadGeneration)) return@launch
-                installMedia(info)
+                if (isCurrentMediaLoad(generation, mediaLoadGeneration)) installMedia(info)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                if (isCurrentMediaLoad(loadGeneration, mediaLoadGeneration)) {
+                if (isCurrentMediaLoad(generation, mediaLoadGeneration)) {
                     _uiState.update {
                         it.copy(
                             isMediaLoading = false,
                             playback = it.playback.copy(
                                 error = "No se pudo abrir el video: " +
-                                    (error.message?.takeIf { it.isNotBlank() }
-                                        ?: error.javaClass.simpleName),
+                                    (error.message?.takeIf(String::isNotBlank) ?: error.javaClass.simpleName),
                             ),
                         )
                     }
                 }
             } finally {
-                // Only the current request may clear the shared pending marker. A stale request
-                // for the same URI must not revoke the newer request's grant; its URI will be
-                // cleaned on the next successful installation if it is no longer active.
-                if (isCurrentMediaLoad(loadGeneration, mediaLoadGeneration)) {
-                    if (pendingMediaGrantUri == uri) pendingMediaGrantUri = null
+                if (isCurrentMediaLoad(generation, mediaLoadGeneration) && pendingMediaGrantUri == uri) {
+                    pendingMediaGrantUri = null
                 }
                 releasePersistedGrantIfUnused(uri)
             }
@@ -362,8 +363,6 @@ class SyncplayViewModel(
     }
 
     fun openUrl(rawUrl: String) {
-        // Validate before cancelling an in-flight SAF selection. A malformed URL
-        // must not discard a valid video that is still being resolved.
         val value = validateHttpMediaUrl(rawUrl)
         if (value == null) {
             setPlaybackError("La URL debe comenzar con http:// o https:// e incluir un host")
@@ -371,27 +370,16 @@ class SyncplayViewModel(
         }
         val uri = value.toUri()
         beginMediaSelection()
-        val name = uri.lastPathSegment
-            ?.substringAfterLast('/')
-            ?.substringBefore('?')
-            ?.takeIf { it.isNotBlank() }
-            ?: uri.host
-            ?: "stream"
-        installMedia(
-            ResolvedMediaInfo(
-                uri = uri,
-                displayName = Uri.decode(name),
-                sizeBytes = 0L,
-                durationSeconds = 0.0,
-                mimeType = inferStreamMime(uri),
-            ),
+        val name = Uri.decode(
+            uri.lastPathSegment?.substringAfterLast('/')?.substringBefore('?')
+                ?.takeIf(String::isNotBlank) ?: uri.host ?: "stream",
         )
+        installMedia(ResolvedMediaInfo(uri, name, 0L, 0.0, mimeType = inferStreamMime(uri)))
     }
 
-    /** Open a file selected by the in-app SMB2/SMB3 browser. */
     internal fun openSmbMedia(picked: SmbPickedFile) {
         beginMediaSelection()
-        val opened = installMedia(
+        installMedia(
             ResolvedMediaInfo(
                 uri = picked.uri,
                 displayName = picked.displayName,
@@ -401,122 +389,231 @@ class SyncplayViewModel(
                 sourceAccess = SourceAccessClassification.SEEKABLE,
             ),
         )
-        if (!opened) {
-            setPlaybackError("No se pudo abrir el archivo por SMB directo")
-        }
     }
 
     fun addSubtitle(uri: Uri, grantFlags: Int = Intent.FLAG_GRANT_READ_URI_PERMISSION) {
-        val selectedMedia = currentMediaInfo
-        val selectedMediaUri = selectedMedia?.uri
-        if (selectedMedia == null || selectedMediaUri == null) {
+        val media = currentMediaInfo ?: run {
             setPlaybackError("Abre primero un video")
             return
         }
         subtitleLoadJob?.cancel()
-        val request = subtitleSelectionGate.begin(selectedMediaUri.toString())
-        pendingSubtitleGrantUri = null
-        _uiState.update {
-            it.copy(
-                isSubtitleLoading = true,
-                playback = it.playback.copy(error = null),
-            )
-        }
+        subtitleTimeoutJob?.cancel()
+        val request = subtitleSelectionGate.begin(media.uri.toString())
         pendingSubtitleGrantUri = uri
-        if (!takeReadPermission(uri, grantFlags)) {
-            PlaybackService.retainReadGrant(app, uri)
-        }
+        _uiState.update { it.copy(isSubtitleLoading = true, playback = it.playback.copy(error = null)) }
+        if (!takeReadPermission(uri, grantFlags)) PlaybackService.retainReadGrant(app, uri)
         subtitleLoadJob = viewModelScope.launch {
             try {
                 val info = withContext(Dispatchers.IO) { MediaInfoResolver.resolve(app, uri) }
                 ensureActive()
                 if (!isCurrentSubtitleRequest(request)) return@launch
-
-                val fileType = SubtitleFileTypes.typeForName(info.displayName)
-                if (fileType == null) {
-                    _uiState.update {
-                        it.copy(
-                            isSubtitleLoading = false,
-                            playback = it.playback.copy(
-                                error = "Formato de subtítulos no compatible: ${info.displayName}. " +
-                                    "Usa SRT, ASS, SSA, VTT o TTML.",
-                            ),
-                        )
-                    }
+                val providerMime = info.mimeType ?: withContext(Dispatchers.IO) {
+                    runCatching { app.contentResolver.getType(uri) }.getOrNull()
+                }
+                val type = SubtitleFileTypes.typeFor(info.displayName, providerMime)
+                if (type == null) {
+                    setPlaybackError("Formato no compatible. Usa SRT, ASS, SSA, VTT, TTML, ZIP, SUP o PGS.")
+                    _uiState.update { it.copy(isSubtitleLoading = false) }
                     return@launch
                 }
-                val configuration = MediaItem.SubtitleConfiguration.Builder(uri)
-                    // Always derive the decoder MIME from the extension. Some
-                    // SMB/file providers report .ass as audio/aac, which is not
-                    // a subtitle MIME and would make Media3 reject the track.
-                    .setMimeType(fileType.mediaMimeType)
-                    .setLabel(info.displayName)
-                    // Media3's MergingMediaSource prefixes this id with its child index. Keeping
-                    // our own unique suffix lets onTracksChanged select this exact sidecar rather
-                    // than letting the embedded DEFAULT PGS track win a selector tie.
-                    // UUID avoids colliding with a sidecar that survived in PlaybackService after
-                    // an Activity/process recreation (the request generation restarts at one).
-                    .setId("$EXTERNAL_SUBTITLE_ID_PREFIX${UUID.randomUUID()}")
-                    .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
-                    .build()
-                if (!isCurrentSubtitleRequest(request)) return@launch
-
-                // A subtitle picker represents a replacement. Keeping previous
-                // configurations here lets Media3 select the first DEFAULT
-                // track, which can leave an older video's subtitle visible.
-                desiredExternalSubtitleId = configuration.id
-                // Loading a subtitle is an explicit request to show it. Clear an older text
-                // override (including "Sin subtítulos") and leave text enabled while MPV adds
-                // the sidecar with `sub-add select`. The exact Media3 override is installed as
-                // soon as the new track is published.
-                resetPlayerSubtitleSelection(disabled = false)
-                val replacementConfigurations = subtitleConfigurations.replaceWithLatest(configuration)
-                if (reinstallCurrentMediaKeepingPosition(replacementConfigurations)) {
-                    subtitleConfigurations = replacementConfigurations
-                    currentSubtitleUri = configuration.uri
-                    releaseObsoletePersistedUriGrants()
-                    startExternalSubtitleSelectionTimeout(configuration.id.orEmpty())
-                } else {
+                val externalId = "external:${UUID.randomUUID()}"
+                desiredExternalSubtitleId = externalId
+                player?.setSubtitleVisibility(!type.isText, MpvEventOrigin.SYSTEM)
+                player?.replaceExternalSubtitles(
+                    listOf(
+                        MpvExternalSubtitle(
+                            id = externalId,
+                            uri = uri,
+                            label = info.displayName,
+                            mimeType = type.mimeType,
+                            isDefault = true,
+                        ),
+                    ),
+                )
+                currentSubtitleUri = uri
+                currentSubtitleDisplayName = info.displayName
+                releaseObsoletePersistedUriGrants()
+                _uiState.update { it.copy(subtitleName = info.displayName) }
+                startSubtitleTimeout(externalId)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (isCurrentSubtitleRequest(request)) {
                     desiredExternalSubtitleId = null
-                    resetPlayerSubtitleSelection(disabled = false)
+                    _uiState.update {
+                        it.copy(isSubtitleLoading = false, playback = it.playback.copy(error = friendlyPlaybackError(error)))
+                    }
                 }
+            } finally {
+                if (pendingSubtitleGrantUri == uri) pendingSubtitleGrantUri = null
+                releasePersistedGrantIfUnused(uri)
+            }
+        }
+    }
+
+    fun selectSubtitleTrack(trackId: String?) {
+        val session = player ?: return
+        if (trackId == null) {
+            session.selectSubtitleTrack(-1)
+            desiredExternalSubtitleId = null
+            _uiState.update { it.copy(subtitleName = null) }
+            return
+        }
+        val track = session.snapshot.value.tracks.findByStableId(trackId) ?: return
+        if (track.type != MpvTrackType.SUBTITLE) return
+        session.selectSubtitleTrack(track.id)
+        _uiState.update { it.copy(subtitleName = subtitleLabel(track)) }
+    }
+
+    fun togglePlayback() {
+        val session = player ?: return
+        if (session.snapshot.value.playWhenReady) session.pause() else session.play()
+    }
+
+    fun seekTo(positionMs: Long) {
+        player?.seekTo(positionMs, exact = true)
+    }
+
+    fun seekBy(deltaMs: Long) {
+        val session = player ?: return
+        session.seekTo((session.snapshot.value.positionMs + deltaMs).coerceAtLeast(0L), exact = true)
+    }
+
+    fun attachVideoOutput(output: Any?) {
+        player?.attachVideoOutput(output)
+    }
+
+    fun clearVideoOutput(output: Any?) {
+        player?.clearVideoOutput(output)
+    }
+
+    fun updateSubtitleAppearance(value: SubtitleAppearance) {
+        val normalized = value.normalized()
+        val current = _uiState.value
+        val switchingAwayFromRemoteFont = normalized.fontFamily != current.subtitlePreferences.appearance.fontFamily &&
+            normalized.fontFamily !in current.remoteSubtitleFonts && current.remoteFontCssUrl.isNotBlank()
+        _uiState.update {
+            it.copy(
+                subtitlePreferences = it.subtitlePreferences.copy(appearance = normalized),
+                remoteSubtitleFonts = if (switchingAwayFromRemoteFont) emptyList() else it.remoteSubtitleFonts,
+                remoteFontCssUrl = if (switchingAwayFromRemoteFont) "" else it.remoteFontCssUrl,
+            )
+        }
+        if (switchingAwayFromRemoteFont) RemoteSubtitleFontLoader.clearSavedCss(app)
+        player?.applySubtitleAppearance(normalized.toMpvProperties())
+        viewModelScope.launch { subtitleSettings.saveAppearance(normalized) }
+    }
+
+    fun resetSubtitleAppearance() {
+        updateSubtitleAppearance(SubtitleAppearance.DEFAULT)
+        loadRemoteSubtitleFont(RemoteSubtitleFontLoader.DEFAULT_CSS_URL, reportFailure = false)
+    }
+
+    fun updateSubtitleSync(value: SubtitleSyncSettings) {
+        val previous = _uiState.value.subtitlePreferences.sync
+        val normalized = value.normalized().let { requested ->
+            if (previous.rememberOffset && !requested.rememberOffset) {
+                requested.copy(offsetMs = 0L)
+            } else {
+                requested
+            }
+        }
+        _uiState.update { current ->
+            current.copy(subtitlePreferences = current.subtitlePreferences.copy(sync = normalized))
+        }
+        player?.setSubtitleDelay(normalized.offsetMs)
+        if (normalized.rememberOffset || previous.rememberOffset != normalized.rememberOffset) {
+            viewModelScope.launch { subtitleSettings.saveSync(normalized) }
+        }
+    }
+
+    fun alignSubtitleCue(skip: Int) {
+        if (skip != -1 && skip != 1) return
+        player?.alignSubtitleCue(skip)
+    }
+
+    fun exportCurrentSubtitle(destinationUri: Uri) {
+        val session = player ?: return
+        val selected = session.snapshot.value.tracks.tracks.firstOrNull { track ->
+            track.type == MpvTrackType.SUBTITLE &&
+                track.id == session.snapshot.value.tracks.selectedSubtitleId
+        }
+        val sourceUri = currentSubtitleUri
+        val sourceName = currentSubtitleDisplayName ?: selected?.label ?: _uiState.value.subtitleName
+        if (selected?.externalId == null || selected.isBitmapSubtitle() || sourceUri == null || sourceName == null ||
+            !SubtitleExport.supports(sourceName)
+        ) {
+            setPlaybackError("Solo se pueden exportar subtítulos de texto externos SRT, VTT, ASS, SSA o ZIP")
+            return
+        }
+        _uiState.update { it.copy(isSubtitleExporting = true, playback = it.playback.copy(error = null)) }
+        viewModelScope.launch {
+            try {
+                val offsetMs = _uiState.value.subtitlePreferences.sync.offsetMs
+                val document = withContext(Dispatchers.IO) {
+                    SubtitleExport.shiftedBytes(sourceName, readSubtitleBytes(sourceUri), offsetMs)
+                }
+                withContext(Dispatchers.IO) {
+                    app.contentResolver.openOutputStream(destinationUri, "wt")
+                        ?.bufferedWriter(Charsets.UTF_8)
+                        ?.use { it.write(document.text) }
+                        ?: throw IOException("Android no permitió escribir el archivo elegido")
+                }
+                _uiState.update { it.copy(isSubtitleExporting = false) }
+                appendSystemMessage("Subtítulos exportados con un desfase de ${offsetMs / 1_000.0} s")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
                 _uiState.update {
                     it.copy(
-                        isSubtitleLoading = desiredExternalSubtitleId != null,
-                        subtitleName = if (desiredExternalSubtitleId != null) {
-                            info.displayName
-                        } else {
-                            it.subtitleName
-                        },
-                        playback = if (desiredExternalSubtitleId == null) {
-                            it.playback.copy(error = "No se pudo aplicar el archivo de subtítulos")
+                        isSubtitleExporting = false,
+                        playback = it.playback.copy(error = "No se pudieron exportar los subtítulos: ${error.message.orEmpty()}"),
+                    )
+                }
+            }
+        }
+    }
+
+    fun updateRemoteFontCssUrl(value: String) {
+        _uiState.update { it.copy(remoteFontCssUrl = value.take(MAX_CSS_URL_LENGTH)) }
+    }
+
+    fun loadRemoteSubtitleFont(rawUrl: String) = loadRemoteSubtitleFont(rawUrl, reportFailure = true)
+
+    private fun loadRemoteSubtitleFont(rawUrl: String, reportFailure: Boolean) {
+        val url = rawUrl.trim()
+        if (url.isEmpty()) {
+            RemoteSubtitleFontLoader.clearSavedCss(app)
+            _uiState.update {
+                it.copy(remoteFontCssUrl = "", remoteSubtitleFonts = emptyList(), isRemoteFontLoading = false)
+            }
+            return
+        }
+        _uiState.update { it.copy(isRemoteFontLoading = true, remoteFontCssUrl = url) }
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { RemoteSubtitleFontLoader.load(app, url) }
+            result.onSuccess { fontSet ->
+                _uiState.update {
+                    it.copy(
+                        isRemoteFontLoading = false,
+                        remoteSubtitleFonts = fontSet.familyNames,
+                        playback = it.playback.copy(error = null),
+                    )
+                }
+                updateSubtitleAppearance(
+                    _uiState.value.subtitlePreferences.appearance.copy(fontFamily = fontSet.primaryFamilyName),
+                )
+            }.onFailure { error ->
+                _uiState.update {
+                    it.copy(
+                        isRemoteFontLoading = false,
+                        playback = if (reportFailure) {
+                            it.playback.copy(error = "No se pudo cargar esa fuente: ${error.message.orEmpty()}")
                         } else {
                             it.playback
                         },
                     )
                 }
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                if (isCurrentSubtitleRequest(request)) {
-                    _uiState.update {
-                        it.copy(
-                            isSubtitleLoading = false,
-                            playback = it.playback.copy(
-                                error = "No se pudo abrir los subtítulos: " +
-                                    (error.message?.takeIf { it.isNotBlank() }
-                                        ?: error.javaClass.simpleName),
-                            ),
-                        )
-                    }
-                }
-            } finally {
-                // A superseded request may have the same URI as the newest request. Only the
-                // current token may clear/revoke its shared pending grant marker.
-                if (isCurrentSubtitleRequest(request)) {
-                    if (pendingSubtitleGrantUri == uri) pendingSubtitleGrantUri = null
-                }
-                releasePersistedGrantIfUnused(uri)
             }
         }
     }
@@ -525,221 +622,11 @@ class SyncplayViewModel(
         _uiState.update { it.copy(playback = it.playback.copy(error = null)) }
     }
 
-    fun setPlaybackEnginePreference(preference: PlaybackEnginePreference) {
-        PlaybackEngineStore.setPreference(preference)
-        val info = currentMediaInfo
-        val selection = if (info != null) {
-            selectPlaybackEngine(
-                preference = preference,
-                displayName = info.displayName,
-                mimeType = info.mimeType,
-                uriPath = info.uri.toString(),
-                sourceAccess = info.sourceAccess,
-            )
-        } else {
-            when (preference) {
-                PlaybackEnginePreference.MPV -> PlaybackEngine.MPV to PlaybackEngineReason.USER_SELECTION
-                PlaybackEnginePreference.MEDIA3,
-                PlaybackEnginePreference.AUTOMATIC,
-                -> PlaybackEngine.MEDIA3 to if (preference == PlaybackEnginePreference.MEDIA3) {
-                    PlaybackEngineReason.USER_SELECTION
-                } else {
-                    PlaybackEngineReason.DEFAULT
-                }
-            }
-        }
-        if (!PlaybackService.setPlaybackEngineNow(selection.first, selection.second)) {
-            setPlaybackError("No se pudo cambiar el motor de reproducción")
-        }
-    }
-
-    /** Select an embedded or side-loaded track from the current prepared Media3 snapshot. */
-    fun selectSubtitleTrack(trackId: String?) {
-        val player = controller ?: return
-        if (!player.isCommandAvailable(Player.COMMAND_SET_TRACK_SELECTION_PARAMETERS)) {
-            setPlaybackError("Este dispositivo no permite cambiar la pista de subtítulos")
-            return
-        }
-
-        // A choice made in the selector supersedes a provider read that may still be completing.
-        // Cancellation alone is insufficient for SMB-backed DocumentsProviders, so invalidate
-        // the request generation as well.
-        val abandonedPendingUri = pendingSubtitleGrantUri
-        subtitleLoadJob?.cancel()
-        subtitleLoadJob = null
-        subtitleSelectionGate.invalidate()
-        pendingSubtitleGrantUri = null
-        desiredExternalSubtitleId = null
-        subtitleSelectionTimeoutJob?.cancel()
-        subtitleSelectionTimeoutJob = null
-        abandonedPendingUri?.let(::releasePersistedGrantIfUnused)
-        if (trackId == null) {
-            val disabled = runCatching {
-                player.trackSelectionParameters = player.trackSelectionParameters
-                    .resetSubtitleSelection(disabled = true)
-            }.isSuccess
-            if (!disabled) {
-                setPlaybackError("No se pudieron desactivar los subtítulos")
-                return
-            }
-            _uiState.update { current ->
-                current.copy(
-                    isSubtitleLoading = false,
-                    subtitleName = null,
-                    subtitleTracks = current.subtitleTracks.map { it.copy(isSelected = false) },
-                    playback = current.playback.copy(error = null),
-                )
-            }
-            return
-        }
-
-        val reference = subtitleTrackReferences(player.currentTracks)
-            .firstOrNull { it.ui.id == trackId }
-        if (reference == null) {
-            handleSubtitleTracksChanged(player.currentTracks)
-            setPlaybackError("La pista cambió mientras la seleccionabas. Inténtalo de nuevo.")
-            return
-        }
-        if (!reference.ui.isSupported) {
-            setPlaybackError("Esta pista de subtítulos no es compatible con el dispositivo")
-            return
-        }
-
-        val selected = runCatching {
-            player.trackSelectionParameters = player.trackSelectionParameters
-                .selectSubtitle(reference)
-        }.isSuccess
-        if (!selected) {
-            setPlaybackError("No se pudo cambiar la pista de subtítulos")
-            return
-        }
-        _uiState.update { current ->
-            current.copy(
-                isSubtitleLoading = false,
-                subtitleName = reference.ui.label,
-                subtitleTracks = current.subtitleTracks.map {
-                    it.copy(isSelected = it.id == reference.ui.id)
-                },
-                playback = current.playback.copy(error = null),
-            )
-        }
-    }
-
-    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
-    private fun connectMediaController() {
-        val token = SessionToken(app, ComponentName(app, PlaybackService::class.java))
-        val future = MediaController.Builder(app, token).buildAsync()
-        val generation = controllerFutures.register(future) ?: return
-        future.addListener(
-            {
-                val result = runCatching { future.get() }
-                val mediaController = result.getOrNull()
-                if (mediaController != null) {
-                    controllerFutures.withCurrent(future, generation, mediaController) {
-                        controller?.takeUnless { it === mediaController }?.let { previous ->
-                            previous.removeListener(playerListener)
-                            synchronizer.detach()
-                            previous.release()
-                        }
-                        controller = mediaController
-                        mediaController.addListener(playerListener)
-                        synchronizer.attach(mediaController)
-                        _uiState.update { it.copy(player = mediaController) }
-                        handleSubtitleTracksChanged(mediaController.currentTracks)
-                        pendingMedia?.let { pending ->
-                            if (installMediaOnPlayer(pending, resetSubtitleSelection = true)) {
-                                pendingMedia = null
-                                releaseObsoletePersistedUriGrants()
-                            } else {
-                                setPlaybackError("El reproductor no pudo preparar el video seleccionado")
-                            }
-                        } ?: rehydrateMediaFromController(mediaController)
-                    }
-                } else {
-                    val error = result.exceptionOrNull() ?: return@addListener
-                    controllerFutures.withCurrent(future, generation) {
-                        setPlaybackError("No se pudo iniciar Media3: ${error.message.orEmpty()}")
-                    }
-                }
-            },
-            ContextCompat.getMainExecutor(app),
-        )
-    }
-
-    private fun installMedia(info: ResolvedMediaInfo): Boolean {
-        mediaRehydrationJob?.cancel()
-        mediaRehydrationJob = null
-        // A subtitle request may have started while this media was still being
-        // resolved. It was tied to the previous currentMediaInfo, so make the
-        // commit point invalidate it as well as the selection start above.
-        subtitleLoadJob?.cancel()
-        subtitleLoadJob = null
-        subtitleSelectionTimeoutJob?.cancel()
-        subtitleSelectionTimeoutJob = null
-        subtitleSelectionGate.invalidate()
-        desiredExternalSubtitleId = null
-        val activeController = controller
-        if (activeController != null && !installMediaOnPlayer(
-                info = info,
-                resetSubtitleSelection = true,
-                subtitleConfigurationsOverride = emptyList(),
-            )
-        ) {
-            _uiState.update {
-                it.copy(
-                    isMediaLoading = false,
-                    playback = it.playback.copy(error = "El reproductor rechazó el video seleccionado"),
-                )
-            }
-            return false
-        }
-
-        // Commit identity, grants and UI only after Media3 accepts the replacement. This keeps the
-        // previous item coherent if a MediaController disconnects during a slow provider hand-off.
-        pendingMediaGrantUri = null
-        pendingSubtitleGrantUri = null
-        currentMediaInfo = info
-        currentMediaUri = info.uri
-        currentSubtitleUri = null
-        subtitleConfigurations = emptyList()
-        lastSentDescriptor = null
-        pendingMedia = if (activeController == null) info else null
-        _uiState.update {
-            it.copy(
-                media = info.descriptor,
-                mediaUri = info.uri.toString(),
-                mediaSourceAccess = info.sourceAccess,
-                isMediaLoading = false,
-                isSubtitleLoading = false,
-                subtitleName = null,
-                subtitleTracks = emptyList(),
-                playback = it.playback.copy(error = null, positionMs = 0L, durationMs = 0L),
-            )
-        }
-        if (activeController != null) {
-            // Only release the previous grant after Media3's controller accepted the replacement.
-            releaseObsoletePersistedUriGrants()
-        }
-        broadcastFile(info.descriptor)
-        return true
-    }
-
-    /**
-     * Start a new media selection and invalidate subtitle work tied to the previous item.
-     *
-     * The generation check complements coroutine cancellation because some content providers keep
-     * reading after cancellation and may resume a stale load later.
-     */
     private fun beginMediaSelection(): Long {
         val generation = ++mediaLoadGeneration
-        mediaRehydrationJob?.cancel()
-        mediaRehydrationJob = null
         mediaLoadJob?.cancel()
-        mediaLoadJob = null
         subtitleLoadJob?.cancel()
-        subtitleLoadJob = null
-        subtitleSelectionTimeoutJob?.cancel()
-        subtitleSelectionTimeoutJob = null
+        subtitleTimeoutJob?.cancel()
         subtitleSelectionGate.invalidate()
         desiredExternalSubtitleId = null
         pendingMediaGrantUri = null
@@ -748,296 +635,348 @@ class SyncplayViewModel(
             it.copy(
                 isMediaLoading = true,
                 isSubtitleLoading = false,
+                isSubtitleExporting = false,
+                subtitleName = null,
                 subtitleTracks = emptyList(),
+                subtitleText = null,
                 playback = it.playback.copy(error = null),
             )
         }
         return generation
     }
 
-    /** Restore UI/file identity when the MediaSession outlives the Activity/ViewModel. */
-    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
-    private fun rehydrateMediaFromController(mediaController: MediaController) {
-        if (currentMediaInfo != null || pendingMedia != null) return
-        val item = mediaController.currentMediaItem ?: return
-        val localConfiguration = item.localConfiguration ?: return
-        val uri = localConfiguration.uri
-        val identity = item.mediaId.takeIf { it.isNotBlank() } ?: uri.toString()
-        val subtitles = localConfiguration.subtitleConfigurations
-        val durationMs = mediaController.duration.takeIf { it != C.TIME_UNSET && it > 0L } ?: 0L
-        val displayName = item.mediaMetadata.title?.toString()?.takeIf { it.isNotBlank() }
-            ?: Uri.decode(uri.lastPathSegment?.substringAfterLast('/').orEmpty()).ifBlank { "Video" }
-        val retainedSizeBytes = item.mediaMetadata.extras
-            ?.getLong(MEDIA_SIZE_BYTES_EXTRA, 0L)
-            ?.coerceAtLeast(0L)
-            ?: 0L
-        val provisional = ResolvedMediaInfo(
-            uri = uri,
-            displayName = displayName,
-            sizeBytes = retainedSizeBytes,
-            durationSeconds = durationMs / 1_000.0,
-            mimeType = localConfiguration.mimeType,
-        )
-
-        currentMediaInfo = provisional
-        currentMediaUri = uri
-        subtitleConfigurations = subtitles
-        currentSubtitleUri = subtitles.singleOrNull()?.uri
-        desiredExternalSubtitleId = null
+    private fun installMedia(info: ResolvedMediaInfo) {
+        currentMediaInfo = info
+        currentMediaUri = info.uri
+        currentSubtitleUri = null
+        currentSubtitleDisplayName = null
         lastSentDescriptor = null
+        PlaybackDiagnosticsStore.restart(info.uri)
         _uiState.update {
             it.copy(
-                media = provisional.descriptor,
-                mediaUri = uri.toString(),
-                mediaSourceAccess = provisional.sourceAccess,
-                subtitleName = subtitles.singleOrNull()?.label,
-                subtitleTracks = subtitleTrackReferences(mediaController.currentTracks).map { it.ui },
-                playback = it.playback.copy(
-                    positionMs = mediaController.currentPosition.coerceAtLeast(0L),
-                    durationMs = durationMs,
-                    paused = !mediaController.playWhenReady,
-                    isReady = mediaController.playbackState == Player.STATE_READY,
-                    error = null,
+                media = info.descriptor,
+                mediaUri = info.uri.toString(),
+                mediaSourceAccess = info.sourceAccess,
+                isMediaLoading = player == null,
+                isSubtitleLoading = false,
+                isSubtitleExporting = false,
+                subtitleName = null,
+                subtitleTracks = emptyList(),
+                subtitleText = null,
+                playback = it.playback.copy(error = null, positionMs = 0L, durationMs = 0L),
+            )
+        }
+        if (player == null) pendingMedia = info else installMediaOnPlayer(info)
+        releaseObsoletePersistedUriGrants()
+        broadcastFile(info.descriptor)
+    }
+
+    private fun installMediaOnPlayer(info: ResolvedMediaInfo) {
+        val session = player ?: return
+        session.open(
+            uri = info.uri,
+            mediaIdentity = info.uri.toString(),
+            title = info.displayName,
+            startPositionMs = 0L,
+            playWhenReady = false,
+        )
+        applySubtitlePreferences(_uiState.value.subtitlePreferences)
+    }
+
+    private fun handlePlayerSnapshot(snapshot: MpvPlaybackSnapshot) {
+        val expected = currentMediaUri?.toString()
+        if (snapshot.mediaIdentity != null && expected != null && snapshot.mediaIdentity != expected) return
+        val duration = snapshot.durationMs.coerceAtLeast(0L)
+        val subtitleFailure = snapshot.subtitleError?.takeIf { desiredExternalSubtitleId != null }
+        if (subtitleFailure != null) {
+            desiredExternalSubtitleId = null
+            subtitleTimeoutJob?.cancel()
+            subtitleTimeoutJob = null
+            currentSubtitleUri = null
+            currentSubtitleDisplayName = null
+            releaseObsoletePersistedUriGrants()
+        }
+        val currentSync = _uiState.value.subtitlePreferences.sync
+        if (snapshot.subtitleDelayMs != currentSync.offsetMs) {
+            val reportedSync = currentSync.copy(offsetMs = snapshot.subtitleDelayMs).normalized()
+            _uiState.update { current ->
+                current.copy(
+                    subtitlePreferences = current.subtitlePreferences.copy(sync = reportedSync),
+                )
+            }
+            if (reportedSync.rememberOffset) {
+                viewModelScope.launch { subtitleSettings.saveSync(reportedSync) }
+            }
+        }
+        val tracks = subtitleTrackUi(snapshot)
+        desiredExternalSubtitleId?.let { desired ->
+            snapshot.tracks.tracks.firstOrNull { it.externalId == desired }?.let { found ->
+                desiredExternalSubtitleId = null
+                subtitleTimeoutJob?.cancel()
+                subtitleTimeoutJob = null
+                if (snapshot.tracks.selectedSubtitleId != found.id) player?.selectSubtitleTrack(found.id)
+            }
+        }
+        val selected = snapshot.tracks.tracks.firstOrNull {
+            it.type == MpvTrackType.SUBTITLE && it.id == snapshot.tracks.selectedSubtitleId
+        }
+        val nativeVisible = selected?.isBitmapSubtitle() == true
+        if (appliedNativeSubtitleVisibility != nativeVisible) {
+            appliedNativeSubtitleVisibility = nativeVisible
+            player?.setSubtitleVisibility(nativeVisible, MpvEventOrigin.SYSTEM)
+        }
+        val error = snapshot.error?.let(::friendlyPlaybackError)
+        _uiState.update { current ->
+            current.copy(
+                playerAvailable = true,
+                isMediaLoading = snapshot.phase == MpvPlaybackPhase.OPENING ||
+                    snapshot.phase == MpvPlaybackPhase.BUFFERING,
+                isSubtitleLoading = desiredExternalSubtitleId != null,
+                subtitleTracks = tracks,
+                subtitleName = when {
+                    selected != null -> subtitleLabel(selected)
+                    desiredExternalSubtitleId != null -> current.subtitleName
+                    else -> null
+                },
+                subtitleText = if (nativeVisible) null else sanitizeSubtitleText(snapshot.subtitleText),
+                playback = current.playback.copy(
+                    positionMs = snapshot.positionMs,
+                    durationMs = duration,
+                    paused = isEffectivelyPaused(snapshot.playWhenReady, snapshot.phase, snapshot.error != null),
+                    isReady = snapshot.phase == MpvPlaybackPhase.PLAYING || snapshot.phase == MpvPlaybackPhase.PAUSED,
+                    isSeekable = snapshot.seekable,
+                    speed = snapshot.rate,
+                    phase = snapshot.phase,
+                    error = subtitleFailure?.let {
+                        "No se pudo cargar ese subtítulo: ${it.cause?.message ?: it.message.orEmpty()}"
+                    } ?: error ?: current.playback.error,
                 ),
             )
         }
-        releaseObsoletePersistedUriGrants()
-        if (_uiState.value.isInRoom) broadcastFile(provisional.descriptor)
+        updateDiagnostics(snapshot, selected)
+        updateDurationAndBroadcast(duration)
+    }
 
-        val generation = mediaLoadGeneration
-        mediaRehydrationJob = viewModelScope.launch {
-            val resolved = withContext(Dispatchers.IO) { MediaInfoResolver.resolve(app, uri) }
-            if (generation != mediaLoadGeneration || controller !== mediaController ||
-                mediaController.currentMediaItem?.let {
-                    it.mediaId.takeIf(String::isNotBlank) ?: it.localConfiguration?.uri?.toString()
-                } != identity || currentMediaUri != uri
-            ) return@launch
+    private fun subtitleTrackUi(snapshot: MpvPlaybackSnapshot): List<SubtitleTrackUi> =
+        MpvTrackMapper.sorted(snapshot.tracks)
+            .filter { it.type == MpvTrackType.SUBTITLE }
+            .map { track ->
+                SubtitleTrackUi(
+                    id = track.stableId,
+                    label = subtitleLabel(track),
+                    detail = listOfNotNull(
+                        track.language?.uppercase(),
+                        track.codec?.uppercase(),
+                        if (track.isForced) "FORZADO" else null,
+                    ).joinToString(" · ").ifBlank { null },
+                    isSelected = track.id == snapshot.tracks.selectedSubtitleId,
+                    isSupported = true,
+                    isExternal = track.externalId != null,
+                    isText = !track.isBitmapSubtitle(),
+                )
+            }
 
-            val refined = if (resolved.durationSeconds > 0.0 || durationMs <= 0L) {
-                resolved
+    private fun subtitleLabel(track: MpvTrackInfo): String = track.label?.takeIf(String::isNotBlank)
+        ?: track.description?.takeIf(String::isNotBlank)
+        ?: track.language?.uppercase()?.let { "Subtítulos $it" }
+        ?: "Subtítulos ${track.id}"
+
+    private fun sanitizeSubtitleText(value: String?): String? = value
+        ?.let(::assSubtitleMarkupToHtml)
+        ?.replace("\\N", "\n")
+        ?.replace("\\n", "\n")
+        ?.replace(Regex("\\{[^}]*\\}"), "")
+        ?.replace(Regex("<[^>]+>")) { match -> sanitizeSubtitleHtmlTag(match.value) }
+        ?.trim()
+        ?.takeIf(String::isNotEmpty)
+
+    private fun assSubtitleMarkupToHtml(value: String): String {
+        var bold = false
+        var italic = false
+        var underline = false
+        var fontColor = false
+        val output = StringBuilder(value.length + 32)
+        var cursor = 0
+        ASS_OVERRIDE_BLOCK.findAll(value).forEach { match ->
+            output.append(value, cursor, match.range.first)
+            val commands = match.groupValues[1]
+            if (ASS_STYLE_RESET.containsMatchIn(commands)) {
+                if (fontColor) output.append("</font>")
+                if (underline) output.append("</u>")
+                if (italic) output.append("</i>")
+                if (bold) output.append("</b>")
+                bold = false
+                italic = false
+                underline = false
+                fontColor = false
+            }
+            Regex("\\\\([biu])([01])", RegexOption.IGNORE_CASE).findAll(commands).forEach { command ->
+                val enabled = command.groupValues[2] == "1"
+                when (command.groupValues[1].lowercase()) {
+                    "b" -> if (enabled != bold) {
+                        output.append(if (enabled) "<b>" else "</b>")
+                        bold = enabled
+                    }
+                    "i" -> if (enabled != italic) {
+                        output.append(if (enabled) "<i>" else "</i>")
+                        italic = enabled
+                    }
+                    "u" -> if (enabled != underline) {
+                        output.append(if (enabled) "<u>" else "</u>")
+                        underline = enabled
+                    }
+                }
+            }
+            ASS_PRIMARY_COLOR.find(commands)?.groupValues?.get(1)?.let { bgr ->
+                if (fontColor) output.append("</font>")
+                val rgb = bgr.chunked(2).reversed().joinToString("")
+                output.append("<font color=\"#").append(rgb).append("\">")
+                fontColor = true
+            }
+            if (ASS_RESET_COLOR.containsMatchIn(commands) && ASS_PRIMARY_COLOR.find(commands) == null && fontColor) {
+                output.append("</font>")
+                fontColor = false
+            }
+            cursor = match.range.last + 1
+        }
+        output.append(value, cursor, value.length)
+        if (fontColor) output.append("</font>")
+        if (underline) output.append("</u>")
+        if (italic) output.append("</i>")
+        if (bold) output.append("</b>")
+        return output.toString()
+            .replace("\\N", "<br>")
+            .replace("\\n", "<br>")
+            .replace("\\h", " ")
+    }
+
+    private fun sanitizeSubtitleHtmlTag(tag: String): String {
+        val normalized = tag.trim()
+        if (normalized.matches(Regex("</?(?:b|i|u)\\s*>", RegexOption.IGNORE_CASE))) return normalized
+        if (normalized.matches(Regex("<br\\s*/?>", RegexOption.IGNORE_CASE))) return "<br>"
+        if (normalized.matches(Regex("</font\\s*>", RegexOption.IGNORE_CASE))) return "</font>"
+        val font = Regex(
+            "<font\\s+color\\s*=\\s*(?:\"([^\"]+)\"|'([^']+)'|([^\\s>]+))\\s*>",
+            RegexOption.IGNORE_CASE,
+        ).matchEntire(normalized)
+        val color = font?.groupValues?.drop(1)?.firstOrNull(String::isNotBlank)
+            ?.let(::normalizeSubtitleHtmlColor)
+        return color?.let { "<font color=\"$it\">" }.orEmpty()
+    }
+
+    private fun normalizeSubtitleHtmlColor(value: String): String? {
+        val trimmed = value.trim()
+        if (trimmed.matches(Regex("#[0-9a-f]{3}(?:[0-9a-f]{3})?", RegexOption.IGNORE_CASE))) {
+            return trimmed
+        }
+        if (trimmed.matches(Regex("[a-z]{3,24}", RegexOption.IGNORE_CASE))) {
+            return trimmed.lowercase()
+        }
+        val rgb = Regex(
+            "rgb\\(\\s*(\\d{1,3})\\s*,\\s*(\\d{1,3})\\s*,\\s*(\\d{1,3})\\s*\\)",
+            RegexOption.IGNORE_CASE,
+        ).matchEntire(trimmed) ?: return null
+        val components = rgb.groupValues.drop(1).mapNotNull(String::toIntOrNull)
+        if (components.size != 3 || components.any { it !in 0..255 }) return null
+        return components.joinToString(prefix = "#", separator = "") { component ->
+            component.toString(16).padStart(2, '0')
+        }
+    }
+
+    private fun applySubtitlePreferences(preferences: SubtitlePreferences) {
+        val session = player ?: return
+        session.applySubtitleAppearance(preferences.appearance.toMpvProperties(), MpvEventOrigin.SYSTEM)
+        session.setSubtitleDelay(preferences.sync.offsetMs, MpvEventOrigin.SYSTEM)
+    }
+
+    /** Rehydrate the visible room after activity recreation while the service keeps MPV alive. */
+    private fun restoreSessionState(snapshot: MpvPlaybackSnapshot) {
+        if (currentMediaInfo != null) return
+        val identity = snapshot.mediaIdentity?.takeIf(String::isNotBlank) ?: return
+        val uri = runCatching { identity.toUri() }.getOrNull() ?: return
+        val title = snapshot.title?.takeIf(String::isNotBlank)
+            ?: Uri.decode(uri.lastPathSegment.orEmpty()).takeIf(String::isNotBlank)
+            ?: "video"
+        val info = ResolvedMediaInfo(
+            uri = uri,
+            displayName = title,
+            sizeBytes = 0L,
+            durationSeconds = snapshot.durationMs.coerceAtLeast(0L) / 1_000.0,
+            sourceAccess = if (snapshot.seekable) {
+                SourceAccessClassification.SEEKABLE
             } else {
-                resolved.copy(durationSeconds = durationMs / 1_000.0)
-            }
-            currentMediaInfo = refined
-            _uiState.update { it.copy(media = refined.descriptor) }
-            if (_uiState.value.isInRoom) broadcastFile(refined.descriptor)
-        }
-    }
-
-    private fun isCurrentSubtitleRequest(request: SubtitleSelectionGate.Request): Boolean =
-        subtitleSelectionGate.isCurrent(request, currentMediaInfo?.uri?.toString())
-
-    private fun installMediaOnPlayer(
-        info: ResolvedMediaInfo,
-        positionMs: Long = 0L,
-        play: Boolean = false,
-        resetSubtitleSelection: Boolean = false,
-        subtitleConfigurationsOverride: List<MediaItem.SubtitleConfiguration> = subtitleConfigurations,
-    ): Boolean {
-        ensurePlaybackEngine(info)
-        val player = controller ?: return false
-        val previousItem = runCatching { player.currentMediaItem }.getOrNull()
-        val previousPositionMs = runCatching { player.currentPosition.coerceAtLeast(0L) }
-            .getOrDefault(0L)
-        val previousPlayWhenReady = runCatching { player.playWhenReady }.getOrDefault(false)
-        val previousTrackParameters = runCatching { player.trackSelectionParameters }.getOrNull()
-        var itemWasReplaced = false
-        return try {
-            if (resetSubtitleSelection) {
-                player.trackSelectionParameters = player.trackSelectionParameters
-                    .resetSubtitleSelection(disabled = false)
-            }
-            val item = createMediaItem(info, subtitleConfigurationsOverride)
-            player.setMediaItem(item, positionMs.coerceAtLeast(0L))
-            itemWasReplaced = true
-            player.prepare()
-            player.playWhenReady = play
-            true
-        } catch (_: Exception) {
-            // MediaController calls are individually asynchronous. If a later command fails after
-            // setMediaItem was accepted, restore the previous single-item state so ViewModel,
-            // grants and PlaybackService cannot describe different media.
-            runCatching {
-                previousTrackParameters?.let { player.trackSelectionParameters = it }
-                if (itemWasReplaced) {
-                    if (previousItem != null) {
-                        player.setMediaItem(previousItem, previousPositionMs)
-                        player.prepare()
-                        player.playWhenReady = previousPlayWhenReady
-                    } else {
-                        player.clearMediaItems()
-                    }
-                }
-            }
-            false
-        }
-    }
-
-    private fun ensurePlaybackEngine(info: ResolvedMediaInfo) {
-        val preference = PlaybackEngineStore.state.value.preference
-        val (engine, reason) = selectPlaybackEngine(
-            preference = preference,
-            displayName = info.displayName,
-            mimeType = info.mimeType,
-            uriPath = info.uri.toString(),
-            sourceAccess = info.sourceAccess,
+                SourceAccessClassification.UNKNOWN
+            },
         )
-        PlaybackService.setPlaybackEngineNow(
-            engine = engine,
-            reason = reason,
-            preserveCurrentMedia = false,
-        )
-    }
-
-    private fun reinstallCurrentMediaKeepingPosition(
-        subtitleConfigurationsOverride: List<MediaItem.SubtitleConfiguration> = subtitleConfigurations,
-    ): Boolean {
-        val player = controller ?: return false
-        val info = currentMediaInfo ?: return false
-        return installMediaOnPlayer(
-            info = info,
-            positionMs = player.currentPosition,
-            play = player.playWhenReady,
-            subtitleConfigurationsOverride = subtitleConfigurationsOverride,
-        )
-    }
-
-    private fun createMediaItem(
-        info: ResolvedMediaInfo,
-        subtitleConfigurationsOverride: List<MediaItem.SubtitleConfiguration> = subtitleConfigurations,
-    ): MediaItem {
-        val builder = MediaItem.Builder()
-            .setMediaId(info.uri.toString())
-            .setUri(info.uri)
-            .setMediaMetadata(
-                MediaMetadata.Builder()
-                    .setTitle(info.displayName)
-                    .setExtras(
-                        Bundle().apply {
-                            putLong(MEDIA_SIZE_BYTES_EXTRA, info.sizeBytes.coerceAtLeast(0L))
-                        },
-                    )
-                    .build(),
-            )
-            .setSubtitleConfigurations(subtitleConfigurationsOverride)
-        info.mimeType?.takeIf { it.isNotBlank() }?.let(builder::setMimeType)
-        return builder.build()
-    }
-
-    private fun handleSubtitleTracksChanged(tracks: Tracks) {
-        val player = controller ?: return
-        val playerMediaIdentity = player.currentMediaItem?.let { item ->
-            item.mediaId.takeIf { it.isNotBlank() }
-                ?: item.localConfiguration?.uri?.toString()
-        }
-        if (!isProgressForMedia(playerMediaIdentity, currentMediaUri?.toString())) return
-        val references = subtitleTrackReferences(tracks)
-        val desiredId = desiredExternalSubtitleId
-        if (desiredId != null) {
-            val external = findExternalSubtitleTrack(tracks, desiredId)
-            if (external != null) {
-                desiredExternalSubtitleId = null
-                subtitleSelectionTimeoutJob?.cancel()
-                subtitleSelectionTimeoutJob = null
-                if (!external.ui.isSupported) {
-                    resetPlayerSubtitleSelection(disabled = false)
-                    _uiState.update { current ->
-                        current.copy(
-                            isSubtitleLoading = false,
-                            subtitleTracks = references.map { it.ui },
-                            playback = current.playback.copy(
-                                error = "El formato de este archivo de subtítulos no es compatible",
-                            ),
-                        )
-                    }
-                    return
-                }
-                if (player.isCommandAvailable(Player.COMMAND_SET_TRACK_SELECTION_PARAMETERS)) {
-                    val selected = runCatching {
-                        player.trackSelectionParameters = player.trackSelectionParameters
-                            .selectSubtitle(external)
-                    }.isSuccess
-                    if (!selected) {
-                        resetPlayerSubtitleSelection(disabled = false)
-                        _uiState.update { current ->
-                            current.copy(
-                                isSubtitleLoading = false,
-                                subtitleTracks = references.map { it.ui },
-                                playback = current.playback.copy(
-                                    error = "No se pudo cambiar la pista de subtítulos",
-                                ),
-                            )
-                        }
-                        return
-                    }
-                    _uiState.update { current ->
-                        current.copy(
-                            isSubtitleLoading = false,
-                            subtitleName = external.ui.label,
-                            subtitleTracks = references.map { reference ->
-                                reference.ui.copy(isSelected = reference.ui.id == external.ui.id)
-                            },
-                            playback = current.playback.copy(error = null),
-                        )
-                    }
-                    return
-                }
-                resetPlayerSubtitleSelection(disabled = false)
-                _uiState.update { current ->
-                    current.copy(
-                        isSubtitleLoading = false,
-                        subtitleTracks = references.map { it.ui },
-                        playback = current.playback.copy(
-                            error = "Este dispositivo no permite cambiar la pista de subtítulos",
-                        ),
-                    )
-                }
-                return
-            }
-        }
-
-        val selected = references.firstOrNull { it.ui.isSelected }?.ui
-        _uiState.update { current ->
-            current.copy(
-                subtitleTracks = references.map { it.ui },
-                subtitleName = selected?.label,
+        currentMediaInfo = info
+        currentMediaUri = uri
+        _uiState.update {
+            it.copy(
+                media = info.descriptor,
+                mediaUri = identity,
+                mediaSourceAccess = info.sourceAccess,
+                isMediaLoading = snapshot.phase == MpvPlaybackPhase.OPENING ||
+                    snapshot.phase == MpvPlaybackPhase.BUFFERING,
             )
         }
     }
 
-    private fun resetPlayerSubtitleSelection(disabled: Boolean) {
-        val player = controller ?: return
-        if (!player.isCommandAvailable(Player.COMMAND_SET_TRACK_SELECTION_PARAMETERS)) return
-        runCatching {
-            player.trackSelectionParameters = player.trackSelectionParameters
-                .resetSubtitleSelection(disabled)
-        }
-    }
-
-    private fun startExternalSubtitleSelectionTimeout(formatId: String) {
-        if (formatId.isBlank()) return
-        subtitleSelectionTimeoutJob?.cancel()
-        subtitleSelectionTimeoutJob = viewModelScope.launch {
-            delay(EXTERNAL_SUBTITLE_SELECTION_TIMEOUT_MS)
-            if (desiredExternalSubtitleId != formatId) return@launch
+    private fun startSubtitleTimeout(externalId: String) {
+        subtitleTimeoutJob?.cancel()
+        subtitleTimeoutJob = viewModelScope.launch {
+            delay(EXTERNAL_SUBTITLE_TIMEOUT_MS)
+            if (desiredExternalSubtitleId != externalId) return@launch
             desiredExternalSubtitleId = null
-            subtitleSelectionTimeoutJob = null
-            resetPlayerSubtitleSelection(disabled = false)
-            _uiState.update { current ->
-                current.copy(
+            _uiState.update {
+                it.copy(
                     isSubtitleLoading = false,
-                    playback = current.playback.copy(
-                        error = "El reproductor no pudo preparar este archivo de subtítulos",
-                    ),
+                    playback = it.playback.copy(error = "MPV no pudo preparar este archivo de subtítulos"),
                 )
             }
         }
     }
 
+    private fun updateDiagnostics(snapshot: MpvPlaybackSnapshot, selectedSubtitle: MpvTrackInfo?) {
+        val video = snapshot.tracks.tracks.firstOrNull { it.type == MpvTrackType.VIDEO }
+        val audio = snapshot.tracks.tracks.firstOrNull { it.type == MpvTrackType.AUDIO }
+        PlaybackDiagnosticsStore.update { current ->
+            current.copy(
+                videoDecoderName = video?.codec?.let { "MPV · $it" } ?: "MPV",
+                audioDecoderName = audio?.codec?.let { "MPV · $it" } ?: "MPV",
+                videoFormat = video?.let {
+                    dev.neura.syncplay.player.VideoFormatDiagnostics(
+                        sampleMimeType = MpvTrackMapper.mimeTypeFor(it),
+                        codecs = it.codec,
+                        width = it.width,
+                        height = it.height,
+                        frameRate = it.frameRate,
+                        bitrate = it.bitrate,
+                        rotationDegrees = it.rotationDegrees,
+                    )
+                },
+                audioFormat = audio?.let {
+                    dev.neura.syncplay.player.AudioFormatDiagnostics(
+                        sampleMimeType = MpvTrackMapper.mimeTypeFor(it),
+                        codecs = it.codec,
+                        channelCount = it.channelCount,
+                        sampleRate = it.sampleRate,
+                        bitrate = it.bitrate,
+                        language = it.language,
+                    )
+                },
+                isBuffering = snapshot.phase == MpvPlaybackPhase.BUFFERING,
+                lastPlayerError = snapshot.error?.javaClass?.simpleName,
+                playerErrorCount = if (snapshot.error != null && current.lastPlayerError == null) {
+                    current.playerErrorCount + 1
+                } else {
+                    current.playerErrorCount
+                },
+                lastLoadError = selectedSubtitle?.codec?.let { "Subtítulos: $it" },
+            )
+        }
+    }
+
     private fun handleLocalPlaybackEvent(event: LocalPlaybackEvent) {
-        // PlaybackSynchronizer only labels PLAYBACK when Media3's playWhenReady flag changed;
-        // remote echoes have already been suppressed there. This also handles the first user
-        // press after a remotely-applied initial pause, for which no prior local event exists.
         val shouldSend = event.doSeek || event.reason == LocalPlaybackChangeReason.PLAYBACK
         if (shouldSend && event.reason != LocalPlaybackChangeReason.SPEED) {
             connection.sendPlaybackChange(event.state, event.doSeek)
@@ -1054,12 +993,7 @@ class SyncplayViewModel(
             else -> "Corrigiendo deriva"
         }
         _uiState.update {
-            it.copy(
-                playback = it.playback.copy(
-                    syncOffsetMs = result.driftErrorMs,
-                    syncAction = action,
-                ),
-            )
+            it.copy(playback = it.playback.copy(syncOffsetMs = result.driftErrorMs, syncAction = action))
         }
     }
 
@@ -1081,76 +1015,51 @@ class SyncplayViewModel(
                 appendSystemMessage("Conectado como ${hello.username} en «${hello.room}»")
                 hello.motd?.let(::appendSystemMessage)
                 connection.sendReady(_uiState.value.localReady, manuallyInitiated = false)
-                currentMediaInfo?.descriptor?.let {
-                    lastSentDescriptor = null
-                    broadcastFile(it)
-                }
+                currentMediaInfo?.descriptor?.let { lastSentDescriptor = null; broadcastFile(it) }
                 connection.requestUserList()
             }
-
             is ProtocolEvent.UserList -> _uiState.update {
                 it.copy(users = event.users.take(MAX_ROOM_USERS).sortedUsers())
             }
-            is ProtocolEvent.UserJoinedOrUpdated -> {
-                _uiState.update { current ->
-                    val old = current.users.firstOrNull { it.username == event.user.username }
-                    if (old == null && current.users.size >= MAX_ROOM_USERS) return@update current
-                    val merged = event.user.copy(
-                        room = event.user.room.ifBlank { old?.room.orEmpty() },
-                        file = if (event.fileProvided) event.user.file else old?.file,
-                        isReady = if (event.readinessProvided) event.user.isReady else old?.isReady,
-                        isController = if (event.controllerProvided) {
-                            event.user.isController
-                        } else {
-                            old?.isController ?: false
-                        },
-                        features = if (event.featuresProvided) {
-                            event.user.features
-                        } else {
-                            old?.features.orEmpty()
-                        },
-                    )
-                    current.copy(users = (current.users.filterNot { it.username == merged.username } + merged).sortedUsers())
-                }
-                if (event.joined) appendSystemMessage("${event.user.username} entró a la sala")
-            }
-
+            is ProtocolEvent.UserJoinedOrUpdated -> _uiState.update { current ->
+                val old = current.users.firstOrNull { it.username == event.user.username }
+                if (old == null && current.users.size >= MAX_ROOM_USERS) return@update current
+                val merged = event.user.copy(
+                    room = event.user.room.ifBlank { old?.room.orEmpty() },
+                    file = if (event.fileProvided) event.user.file else old?.file,
+                    isReady = if (event.readinessProvided) event.user.isReady else old?.isReady,
+                    isController = if (event.controllerProvided) event.user.isController else old?.isController ?: false,
+                    features = if (event.featuresProvided) event.user.features else old?.features.orEmpty(),
+                )
+                current.copy(users = (current.users.filterNot { it.username == merged.username } + merged).sortedUsers())
+            }.also { if (event.joined) appendSystemMessage("${event.user.username} entró a la sala") }
             is ProtocolEvent.UserLeft -> {
                 _uiState.update { it.copy(users = it.users.filterNot { user -> user.username == event.username }) }
                 appendSystemMessage("${event.username} salió")
             }
-
-            is ProtocolEvent.RoomChanged -> {
-                _uiState.update { it.copy(effectiveRoom = event.room, form = it.form.copy(room = event.room)) }
+            is ProtocolEvent.RoomChanged -> _uiState.update {
+                it.copy(effectiveRoom = event.room, form = it.form.copy(room = event.room))
             }
-
-            is ProtocolEvent.ReadyChanged -> {
-                _uiState.update { current ->
-                    current.copy(
-                        users = current.users.map { user ->
-                            if (user.username == event.username) user.copy(isReady = event.isReady) else user
-                        },
-                        localReady = if (event.username == current.effectiveUsername) event.isReady else current.localReady,
-                    )
-                }
+            is ProtocolEvent.ReadyChanged -> _uiState.update { current ->
+                current.copy(
+                    users = current.users.map { user ->
+                        if (user.username == event.username) user.copy(isReady = event.isReady) else user
+                    },
+                    localReady = if (event.username == current.effectiveUsername) event.isReady else current.localReady,
+                )
             }
-
             is ProtocolEvent.Chat -> appendChat(event.username, event.message)
             is ProtocolEvent.Playback -> synchronizer.applyRemoteState(event.value)
             is ProtocolEvent.PlaylistChanged -> {
                 _uiState.update { it.copy(sharedPlaylist = event.files.take(MAX_PLAYLIST_ITEMS)) }
-                if (event.setBy != null) appendSystemMessage("${event.setBy} actualizó la lista compartida")
+                event.setBy?.let { appendSystemMessage("$it actualizó la lista compartida") }
             }
-
             is ProtocolEvent.PlaylistIndexChanged -> _uiState.update { it.copy(sharedPlaylistIndex = event.index) }
-            is ProtocolEvent.FeaturesChanged -> {
-                _uiState.update { current ->
-                    current.copy(users = current.users.map { user ->
-                        if (user.username == event.username) user.copy(features = event.features) else user
-                    })
-                }
+            is ProtocolEvent.FeaturesChanged -> _uiState.update { current ->
+                current.copy(users = current.users.map { user ->
+                    if (user.username == event.username) user.copy(features = event.features) else user
+                })
             }
-
             is ProtocolEvent.Notice -> appendSystemMessage(event.message)
             is ProtocolEvent.Error -> appendSystemMessage("Error del servidor: ${event.message}")
         }
@@ -1175,21 +1084,13 @@ class SyncplayViewModel(
     }
 
     private fun appendChat(username: String, message: String) {
-        val entry = ChatEntry(
-            id = ++chatSequence,
-            username = username.take(MAX_PROTOCOL_NAME_LENGTH),
-            message = message.take(MAX_INCOMING_MESSAGE_LENGTH),
-        )
+        val entry = ChatEntry(++chatSequence, username.take(MAX_PROTOCOL_NAME_LENGTH), message.take(MAX_INCOMING_MESSAGE_LENGTH))
         _uiState.update { it.copy(chat = (it.chat + entry).takeLast(MAX_CHAT_HISTORY)) }
     }
 
     private fun appendSystemMessage(message: String) {
         if (message.isBlank()) return
-        val entry = ChatEntry(
-            id = ++chatSequence,
-            username = null,
-            message = message.take(MAX_INCOMING_MESSAGE_LENGTH),
-        )
+        val entry = ChatEntry(++chatSequence, null, message.take(MAX_INCOMING_MESSAGE_LENGTH))
         _uiState.update { it.copy(chat = (it.chat + entry).takeLast(MAX_CHAT_HISTORY)) }
     }
 
@@ -1197,71 +1098,87 @@ class SyncplayViewModel(
         viewModelScope.launch {
             try {
                 settings.saveConnection(config)
-            } catch (error: Exception) {
-                if (error is CancellationException) throw error
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
                 val message = "No se pudo recordar la contraseña cifrada en este dispositivo"
-                if (_uiState.value.isInRoom) {
-                    appendSystemMessage(message)
-                } else {
-                    _uiState.update { it.copy(formError = message) }
-                }
+                if (_uiState.value.isInRoom) appendSystemMessage(message)
+                else _uiState.update { it.copy(formError = message) }
             }
+        }
+    }
+
+    private fun restartProtocolEventCollection() {
+        protocolEventsJob?.cancel()
+        protocolEventsJob = viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            connection.events.collect(::handleProtocolEvent)
         }
     }
 
     private fun takeReadPermission(uri: Uri, grantFlags: Int): Boolean {
         if (!uri.scheme.equals(ContentResolver.SCHEME_CONTENT, ignoreCase = true)) return false
         if (grantFlags and Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION == 0) return false
-        val takeFlags = grantFlags and Intent.FLAG_GRANT_READ_URI_PERMISSION
-        if (takeFlags == 0) return false
+        val flags = grantFlags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+        if (flags == 0) return false
         val persisted = runCatching {
-            app.contentResolver.takePersistableUriPermission(uri, takeFlags)
+            app.contentResolver.takePersistableUriPermission(uri, flags)
             true
         }.getOrDefault(false)
         if (persisted) persistedSelectionUris += uri
         return persisted
     }
 
-    /**
-     * Keep only the current video and subtitle's persisted read grants acquired by this ViewModel.
-     * Transient GET_CONTENT grants never enter [persistedSelectionUris] and are therefore
-     * untouched. This is intentionally not called from [onCleared], so the active player keeps its
-     * grant while the service is still able to read the current file.
-     */
     private fun releaseObsoletePersistedUriGrants() {
-        val activeUris = setOfNotNull(currentMediaUri, currentSubtitleUri)
-        stalePersistedUris(persistedSelectionUris, activeUris).forEach { uri ->
-            val released = runCatching {
-                app.contentResolver.releasePersistableUriPermission(
-                    uri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
-                )
-            }.isSuccess
-            if (released) persistedSelectionUris.remove(uri)
+        val active = setOfNotNull(currentMediaUri, currentSubtitleUri)
+        stalePersistedUris(persistedSelectionUris, active).forEach { uri ->
+            if (runCatching {
+                    app.contentResolver.releasePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }.isSuccess
+            ) persistedSelectionUris.remove(uri)
         }
     }
 
-    /** Release a grant acquired by a stale/failed selection once it is no longer protected. */
     private fun releasePersistedGrantIfUnused(uri: Uri) {
         if (uri == currentMediaUri || uri == currentSubtitleUri ||
-            uri == pendingMediaGrantUri || uri == pendingSubtitleGrantUri
-        ) {
-            return
-        }
-        if (uri !in persistedSelectionUris) return
-        val released = runCatching {
-            app.contentResolver.releasePersistableUriPermission(
-                uri,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION,
-            )
-        }.isSuccess
-        if (released) persistedSelectionUris.remove(uri)
+            uri == pendingMediaGrantUri || uri == pendingSubtitleGrantUri || uri !in persistedSelectionUris
+        ) return
+        if (runCatching {
+                app.contentResolver.releasePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }.isSuccess
+        ) persistedSelectionUris.remove(uri)
     }
 
+    private fun isCurrentSubtitleRequest(request: SubtitleSelectionGate.Request): Boolean =
+        subtitleSelectionGate.isCurrent(request, currentMediaInfo?.uri?.toString())
+
     private fun inferStreamMime(uri: Uri): String? = when {
-        uri.lastPathSegment?.substringBefore('?')?.endsWith(".m3u8", ignoreCase = true) == true -> MimeTypes.APPLICATION_M3U8
-        uri.lastPathSegment?.substringBefore('?')?.endsWith(".mpd", ignoreCase = true) == true -> MimeTypes.APPLICATION_MPD
+        uri.lastPathSegment?.substringBefore('?')?.endsWith(".m3u8", true) == true -> "application/x-mpegURL"
+        uri.lastPathSegment?.substringBefore('?')?.endsWith(".mpd", true) == true -> "application/dash+xml"
         else -> null
+    }
+
+    private fun readSubtitleBytes(uri: Uri): ByteArray {
+        val input = if (SmbUri.isSmbUri(uri)) {
+            SmbPlaybackEnvironment.openInputStream(uri)
+        } else {
+            app.contentResolver.openInputStream(uri)
+                ?: throw IOException("Android no pudo volver a abrir los subtítulos")
+        }
+        return input.use { source ->
+            val output = ByteArrayOutputStream(64 * 1_024)
+            val buffer = ByteArray(64 * 1_024)
+            var total = 0L
+            while (true) {
+                val count = source.read(buffer)
+                if (count < 0) break
+                total += count
+                if (total > MAX_EXPORT_SUBTITLE_BYTES) {
+                    throw IOException("El archivo de subtítulos es demasiado grande")
+                }
+                output.write(buffer, 0, count)
+            }
+            output.toByteArray()
+        }
     }
 
     private fun List<RoomUser>.sortedUsers(): List<RoomUser> = sortedWith(
@@ -1274,41 +1191,23 @@ class SyncplayViewModel(
         _uiState.update { it.copy(playback = it.playback.copy(error = message)) }
     }
 
-    private fun restartProtocolEventCollection() {
-        protocolEventsJob?.cancel()
-        protocolEventsJob = viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
-            connection.events.collect(::handleProtocolEvent)
-        }
-    }
-
     private fun roomWithoutControllerPassword(value: String): String {
         val room = value.trim()
-        return if (room.startsWith('+') && room.count { it == ':' } >= 2) {
-            room.substringBeforeLast(':')
-        } else {
-            room
-        }
+        return if (room.startsWith('+') && room.count { it == ':' } >= 2) room.substringBeforeLast(':') else room
     }
 
     override fun onCleared() {
         protocolEventsJob?.cancel()
-        protocolEventsJob = null
         mediaLoadJob?.cancel()
-        mediaLoadJob = null
-        mediaRehydrationJob?.cancel()
-        mediaRehydrationJob = null
         subtitleLoadJob?.cancel()
-        subtitleLoadJob = null
-        subtitleSelectionTimeoutJob?.cancel()
-        subtitleSelectionTimeoutJob = null
+        subtitleTimeoutJob?.cancel()
         subtitleSelectionGate.invalidate()
-        // Invalidate/release the future before closing the synchronizer. Its listener runs on
-        // another callback turn and must observe the cleared owner before attempting to attach.
-        controllerFutures.clear()
-        controller?.removeListener(playerListener)
+        detachPlayer()
+        if (serviceBound) runCatching { app.unbindService(serviceConnection) }
+        serviceBound = false
         synchronizer.close()
         connection.close()
-        controller = null
+        super.onCleared()
     }
 
     private companion object {
@@ -1317,7 +1216,12 @@ class SyncplayViewModel(
         const val MAX_PROTOCOL_NAME_LENGTH = 256
         const val MAX_ROOM_USERS = 500
         const val MAX_PLAYLIST_ITEMS = 1_000
-        const val EXTERNAL_SUBTITLE_SELECTION_TIMEOUT_MS = 60_000L
-        const val MEDIA_SIZE_BYTES_EXTRA = "dev.neura.syncplay.media.SIZE_BYTES"
+        const val EXTERNAL_SUBTITLE_TIMEOUT_MS = 60_000L
+        const val MAX_CSS_URL_LENGTH = 2_048
+        const val MAX_EXPORT_SUBTITLE_BYTES = 64L * 1_024L * 1_024L
+        val ASS_OVERRIDE_BLOCK = Regex("\\{([^}]*)\\}")
+        val ASS_STYLE_RESET = Regex("\\\\r(?:[^}]*)?", RegexOption.IGNORE_CASE)
+        val ASS_PRIMARY_COLOR = Regex("\\\\(?:1?c)&H([0-9a-f]{6})&", RegexOption.IGNORE_CASE)
+        val ASS_RESET_COLOR = Regex("\\\\(?:1?c)(?!&H)", RegexOption.IGNORE_CASE)
     }
 }

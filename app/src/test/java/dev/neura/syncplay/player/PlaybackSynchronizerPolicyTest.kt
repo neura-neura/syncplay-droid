@@ -1,5 +1,6 @@
 package dev.neura.syncplay.player
 
+import dev.neura.syncplay.player.mpv.MpvPlaybackPhase
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -99,14 +100,14 @@ class PlaybackSynchronizerPolicyTest {
         assertEquals(
             false,
             canSeekForRemoteCorrection(
-                playbackState = androidx.media3.common.Player.STATE_BUFFERING,
+                phase = MpvPlaybackPhase.BUFFERING,
                 forceSeek = false,
             ),
         )
         assertEquals(
             true,
             canSeekForRemoteCorrection(
-                playbackState = androidx.media3.common.Player.STATE_READY,
+                phase = MpvPlaybackPhase.PLAYING,
                 forceSeek = false,
             ),
         )
@@ -117,7 +118,7 @@ class PlaybackSynchronizerPolicyTest {
         assertEquals(
             true,
             canSeekForRemoteCorrection(
-                playbackState = androidx.media3.common.Player.STATE_BUFFERING,
+                phase = MpvPlaybackPhase.BUFFERING,
                 forceSeek = true,
             ),
         )
@@ -125,51 +126,10 @@ class PlaybackSynchronizerPolicyTest {
 
     @Test
     fun idleEndedAndFatalErrorAreNeverAdvertisedAsPlaying() {
-        assertTrue(isEffectivelyPaused(true, androidx.media3.common.Player.STATE_IDLE, false))
-        assertTrue(isEffectivelyPaused(true, androidx.media3.common.Player.STATE_ENDED, false))
-        assertTrue(isEffectivelyPaused(true, androidx.media3.common.Player.STATE_READY, true))
-        assertEquals(false, isEffectivelyPaused(true, androidx.media3.common.Player.STATE_BUFFERING, false))
-    }
-
-    @Test
-    fun playWhenReadyChangeWinsOverCoalescedTimelineForSameMedia() {
-        val reason = classifyLocalPlaybackChange(
-            doSeek = false,
-            mediaIdentityChanged = false,
-            mediaItemTransition = true,
-            timelineChanged = true,
-            playbackParametersChanged = false,
-            playWhenReadyChanged = true,
-        )
-
-        assertEquals(LocalPlaybackChangeReason.PLAYBACK, reason)
-    }
-
-    @Test
-    fun mediaIdentityChangeWinsOverCoalescedPlayWhenReadyChange() {
-        val reason = classifyLocalPlaybackChange(
-            doSeek = false,
-            mediaIdentityChanged = true,
-            mediaItemTransition = true,
-            timelineChanged = true,
-            playbackParametersChanged = false,
-            playWhenReadyChanged = true,
-        )
-
-        assertEquals(LocalPlaybackChangeReason.MEDIA_ITEM, reason)
-    }
-
-    @Test
-    fun timelineWithoutPlayWhenReadyChangeRemainsMediaItemEvent() {
-        val reason = classifyLocalPlaybackChange(
-            doSeek = false,
-            mediaIdentityChanged = false,
-            mediaItemTransition = false,
-            timelineChanged = true,
-            playbackParametersChanged = false,
-            playWhenReadyChanged = false,
-        )
-
-        assertEquals(LocalPlaybackChangeReason.MEDIA_ITEM, reason)
+        assertTrue(isEffectivelyPaused(true, MpvPlaybackPhase.IDLE, false))
+        assertTrue(isEffectivelyPaused(true, MpvPlaybackPhase.ENDED, false))
+        assertTrue(isEffectivelyPaused(true, MpvPlaybackPhase.ERROR, false))
+        assertTrue(isEffectivelyPaused(true, MpvPlaybackPhase.PLAYING, true))
+        assertEquals(false, isEffectivelyPaused(true, MpvPlaybackPhase.BUFFERING, false))
     }
 }

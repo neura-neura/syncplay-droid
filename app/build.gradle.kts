@@ -11,8 +11,8 @@ android {
         applicationId = "dev.neura.syncplay"
         minSdk = 23
         targetSdk = 37
-        versionCode = 10
-        versionName = "0.3.4"
+        versionCode = 11
+        versionName = "0.4.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
@@ -73,15 +73,8 @@ dependencies {
     implementation("androidx.compose.material3:material3:1.5.0-alpha24")
     implementation("androidx.compose.material:material-icons-extended")
 
-    val media3Version = "1.11.0"
-    implementation("androidx.media3:media3-datasource:$media3Version")
-    implementation("androidx.media3:media3-exoplayer:$media3Version")
-    implementation("androidx.media3:media3-exoplayer-dash:$media3Version")
-    implementation("androidx.media3:media3-exoplayer-hls:$media3Version")
-    implementation("androidx.media3:media3-session:$media3Version")
-    implementation("androidx.media3:media3-ui:$media3Version")
-    // Native libmpv/FFmpeg/libass backend for demanding Matroska/HEVC sources. Media3 remains
-    // the app's Player/MediaSession contract; see THIRD_PARTY_NOTICES.md for GPLv3 obligations.
+    // Sole playback backend. libmpv owns demuxing, decoding, presentation and subtitle tracks;
+    // see THIRD_PARTY_NOTICES.md for the bundled native components and GPLv3 obligations.
     implementation("io.github.abdallahmehiz:mpv-android-lib:0.1.12")
 
     implementation("com.google.code.gson:gson:2.14.0")

@@ -1,4 +1,4 @@
-package dev.neura.syncplay.player.vlc
+package dev.neura.syncplay.player.mpv
 
 import android.content.ContentResolver
 import android.content.Context
@@ -18,10 +18,6 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.TextureView
 import androidx.core.content.ContextCompat
-import androidx.media3.common.C
-import androidx.media3.common.Format
-import androidx.media3.datasource.DataSourceInputStream
-import androidx.media3.datasource.DataSpec
 import dev.neura.syncplay.smb.SmbPlaybackEnvironment
 import dev.neura.syncplay.smb.SmbUri
 import `is`.xyz.mpv.MPV
@@ -32,28 +28,31 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.InterruptedIOException
 import java.util.Locale
+import java.util.zip.ZipInputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.roundToLong
 
-/** External subtitle information passed from Media3's MediaItem. */
-data class VlcExternalSubtitle(
+/** External subtitle metadata passed directly to libmpv. */
+data class MpvExternalSubtitle(
     val id: String?,
     val uri: Uri,
     val language: String? = null,
     val label: String? = null,
     val mimeType: String? = null,
-    val selectionFlags: Int = 0,
+    val isDefault: Boolean = false,
+    val isForced: Boolean = false,
 )
 
-/** The narrow native-engine surface consumed by [VlcPlayer]. */
-interface VlcPlayerEngine : Closeable {
-    fun setListener(listener: ((VlcEngineEvent) -> Unit)?)
+/** The narrow native-engine surface consumed by [MpvPlaybackSession]. */
+interface MpvPlayerEngine : Closeable {
+    fun setListener(listener: ((MpvEngineEvent) -> Unit)?)
     fun setMedia(
         uri: Uri,
-        externalSubtitles: List<VlcExternalSubtitle> = emptyList(),
+        externalSubtitles: List<MpvExternalSubtitle> = emptyList(),
         startPositionMs: Long = 0L,
     )
     fun prepare()
@@ -61,17 +60,22 @@ interface VlcPlayerEngine : Closeable {
     fun pause()
     fun stop()
     fun clearMedia() = Unit
-    fun seekTo(positionMs: Long)
+    fun seekTo(positionMs: Long, exact: Boolean = false)
     fun setRate(rate: Float)
     fun getRate(): Float
     fun setVolume(volume: Float)
     fun getVolume(): Float
+    fun replaceExternalSubtitles(subtitles: List<MpvExternalSubtitle>) = Unit
+    fun applySubtitleAppearance(properties: Map<String, Any>) = Unit
+    fun setSubtitleDelay(delayMs: Long) = Unit
+    fun alignSubtitleCue(skip: Int) = Unit
+    fun setSubtitleVisibility(visible: Boolean) = Unit
     fun setVideoOutput(output: Any?)
     fun clearVideoOutput(output: Any?)
     fun selectAudioTrack(id: Int) = Unit
     fun selectVideoTrack(id: Int) = Unit
     fun selectSubtitleTrack(id: Int)
-    fun currentSnapshot(): VlcTrackSnapshot
+    fun currentSnapshot(): MpvTrackSnapshot
     fun currentPositionMs(): Long
     fun currentDurationMs(): Long
     fun isSeekable(): Boolean
@@ -81,15 +85,15 @@ interface VlcPlayerEngine : Closeable {
 /**
  * libmpv implementation used for demanding Matroska/HEVC playback.
  *
- * AndroidX Media3 remains the public Player and MediaSession contract. libmpv owns demuxing,
- * MediaCodec/software decoding, GPU presentation and libass subtitle rendering. Every blocking
- * native command runs on [commandThread], while events return to the Media3 player's looper.
+ * libmpv owns demuxing, MediaCodec/software decoding, GPU presentation and libass subtitle
+ * rendering. Every blocking native command runs on [commandThread], while events are marshalled
+ * to the supplied event handler.
  */
 class LibMpvEngine(
     context: Context,
     private val eventHandler: Handler = Handler(Looper.getMainLooper()),
     private val onInitializationStage: (String) -> Unit = {},
-) : VlcPlayerEngine, MPV.EventObserver {
+) : MpvPlayerEngine, MPV.EventObserver {
     private val appContext = context.applicationContext
     private val commandThread = HandlerThread("Syncplay-libmpv").apply { start() }
     private val commandHandler = Handler(commandThread.looper)
@@ -99,11 +103,11 @@ class LibMpvEngine(
     private val mediaGeneration = AtomicLong(0L)
     private val subtitleLoad = AtomicReference<SubtitleLoadJob?>()
 
-    @Volatile private var listener: ((VlcEngineEvent) -> Unit)? = null
+    @Volatile private var listener: ((MpvEngineEvent) -> Unit)? = null
     @Volatile private var initializationError: Throwable? = null
-    @Volatile private var snapshot = VlcTrackSnapshot()
+    @Volatile private var snapshot = MpvTrackSnapshot()
     @Volatile private var positionMs = 0L
-    @Volatile private var durationMs = C.TIME_UNSET
+    @Volatile private var durationMs = -1L
     @Volatile private var seekable = false
     @Volatile private var rate = 1f
     @Volatile private var volume = 1f
@@ -117,7 +121,7 @@ class LibMpvEngine(
     private var activeSourceGeneration = 0L
     private var pendingSubtitles: List<OpenedMpvSubtitle> = emptyList()
     private var activeSubtitles: List<OpenedMpvSubtitle> = emptyList()
-    private var configuredSubtitles: List<VlcExternalSubtitle> = emptyList()
+    private var configuredSubtitles: List<MpvExternalSubtitle> = emptyList()
     private var activeLease: MpvSourceLease? = null
     /** Load commands and END_FILE events are correlated by mpv's lifetime-unique playlist id. */
     private val awaitingStartLeases = java.util.ArrayDeque<MpvSourceLease>()
@@ -188,7 +192,7 @@ class LibMpvEngine(
         commandHandler.post(::initializeNativePlayer)
     }
 
-    override fun setListener(listener: ((VlcEngineEvent) -> Unit)?) {
+    override fun setListener(listener: ((MpvEngineEvent) -> Unit)?) {
         this.listener = listener
         initializationError?.let { error ->
             if (listener != null) emitPlaybackError(error)
@@ -197,15 +201,15 @@ class LibMpvEngine(
 
     override fun setMedia(
         uri: Uri,
-        externalSubtitles: List<VlcExternalSubtitle>,
+        externalSubtitles: List<MpvExternalSubtitle>,
         startPositionMs: Long,
     ) {
         val generation = mediaGeneration.incrementAndGet()
         cancelSubtitleLoad()
         positionMs = startPositionMs.coerceAtLeast(0L)
-        durationMs = C.TIME_UNSET
+        durationMs = -1L
         seekable = false
-        snapshot = VlcTrackSnapshot()
+        snapshot = MpvTrackSnapshot()
         dispatch("open source") { core ->
             if (generation != mediaGeneration.get()) return@dispatch
             unloadCurrentMedia(core)
@@ -216,7 +220,7 @@ class LibMpvEngine(
                 pendingSubtitles = emptyList()
                 pendingStartPositionMs = startPositionMs.coerceAtLeast(0L)
                 fileLoaded = false
-                emit(VlcEngineEvent(VlcEngineEvent.Kind.MEDIA_CHANGED, positionMs = positionMs))
+                emit(MpvEngineEvent(MpvEngineEvent.Kind.MEDIA_CHANGED, positionMs = positionMs))
                 scheduleSubtitleLoad(generation, externalSubtitles)
             } catch (error: Throwable) {
                 emitPlaybackError(error)
@@ -228,7 +232,7 @@ class LibMpvEngine(
         dispatch("prepare") { core ->
             val source = pendingSource ?: activeSource ?: return@dispatch
             if (source === activeSource && activeLease?.ended == false) return@dispatch
-            emit(VlcEngineEvent(VlcEngineEvent.Kind.OPENING, positionMs = positionMs))
+            emit(MpvEngineEvent(MpvEngineEvent.Kind.OPENING, positionMs = positionMs))
             core.setPropertyBoolean("pause", true)
             if (source === pendingSource) {
                 activeSource = source
@@ -269,7 +273,7 @@ class LibMpvEngine(
         dispatch("stop") { core ->
             core.command("stop")
             fileLoaded = false
-            emit(VlcEngineEvent(VlcEngineEvent.Kind.STOPPED, positionMs = positionMs))
+            emit(MpvEngineEvent(MpvEngineEvent.Kind.STOPPED, positionMs = positionMs))
         }
     }
 
@@ -279,16 +283,16 @@ class LibMpvEngine(
         dispatch("clear media") { unloadCurrentMedia(it) }
     }
 
-    override fun seekTo(positionMs: Long) {
+    override fun seekTo(positionMs: Long, exact: Boolean) {
         val target = positionMs.coerceAtLeast(0L)
         this.positionMs = target
         dispatch("seek") { core ->
             if (fileLoaded) {
-                core.command("seek", seconds(target).toString(), "absolute+exact")
+                core.command("seek", seconds(target).toString(), if (exact) "absolute+exact" else "absolute")
             } else {
                 pendingStartPositionMs = target
             }
-            emit(VlcEngineEvent(VlcEngineEvent.Kind.POSITION_CHANGED, positionMs = target))
+            emit(MpvEngineEvent(MpvEngineEvent.Kind.POSITION_CHANGED, positionMs = target))
         }
     }
 
@@ -306,6 +310,59 @@ class LibMpvEngine(
     }
 
     override fun getVolume(): Float = volume
+
+    override fun replaceExternalSubtitles(subtitles: List<MpvExternalSubtitle>) {
+        configuredSubtitles = subtitles.toList()
+        cancelSubtitleLoad()
+        val generation = mediaGeneration.get()
+        dispatch("replace subtitles") { core ->
+            // Remove only tracks that this session added; embedded streams remain available.
+            snapshot.tracks.filter { it.type == MpvTrackType.SUBTITLE && it.externalId != null }
+                .forEach { track -> runCatching { core.command("sub-remove", track.id.toString()) } }
+            activeSubtitles.forEach(OpenedMpvSubtitle::close)
+            activeSubtitles = emptyList()
+            pendingSubtitles.forEach(OpenedMpvSubtitle::close)
+            pendingSubtitles = emptyList()
+            if (fileLoaded) refreshTracks()
+        }
+        scheduleSubtitleLoad(generation, subtitles)
+    }
+
+    override fun applySubtitleAppearance(properties: Map<String, Any>) {
+        if (properties.isEmpty()) return
+        dispatch("subtitle appearance") { core ->
+            properties.forEach { (name, value) ->
+                when (value) {
+                    is Boolean -> core.setPropertyBoolean(name, value)
+                    is Number -> core.setPropertyDouble(name, value.toDouble())
+                    is String -> core.setPropertyString(name, value)
+                }
+            }
+        }
+    }
+
+    override fun setSubtitleDelay(delayMs: Long) {
+        dispatch("subtitle delay") { it.setPropertyDouble("sub-delay", delayMs / 1_000.0) }
+    }
+
+    override fun alignSubtitleCue(skip: Int) {
+        require(skip == -1 || skip == 1) { "Subtitle cue direction must be -1 or 1" }
+        dispatch("subtitle cue alignment") { core ->
+            core.command("sub-step", skip.toString(), "primary")
+            core.getPropertyDouble("sub-delay")?.takeIf(Double::isFinite)?.let { seconds ->
+                emit(
+                    MpvEngineEvent(
+                        MpvEngineEvent.Kind.SUBTITLE_DELAY_CHANGED,
+                        subtitleDelayMs = (seconds * 1_000.0).roundToLong(),
+                    ),
+                )
+            }
+        }
+    }
+
+    override fun setSubtitleVisibility(visible: Boolean) {
+        dispatch("subtitle visibility") { it.setPropertyBoolean("sub-visibility", visible) }
+    }
 
     override fun setVideoOutput(output: Any?) {
         if (released || this.output === output) return
@@ -353,7 +410,7 @@ class LibMpvEngine(
 
     override fun selectSubtitleTrack(id: Int) = selectTrack("sid", id)
 
-    override fun currentSnapshot(): VlcTrackSnapshot = snapshot
+    override fun currentSnapshot(): MpvTrackSnapshot = snapshot
     override fun currentPositionMs(): Long = positionMs
     override fun currentDurationMs(): Long = durationMs
     override fun isSeekable(): Boolean = seekable
@@ -394,7 +451,15 @@ class LibMpvEngine(
         }
     }
 
-    override fun eventProperty(property: String) = Unit
+    override fun eventProperty(property: String) {
+        if (property == "sub-text/ass") {
+            postNativeEvent("property sub-text/ass") {
+                if (isCurrentNativeLoad()) emit(
+                    MpvEngineEvent(MpvEngineEvent.Kind.SUBTITLE_TEXT_CHANGED, subtitleText = null),
+                )
+            }
+        }
+    }
 
     override fun eventProperty(property: String, value: Long) {
         postNativeEvent("property $property") {
@@ -409,8 +474,15 @@ class LibMpvEngine(
     }
 
     override fun eventProperty(property: String, value: String) {
-        if (property == "sid" || property == "aid" || property == "vid") {
-            postNativeEvent("property $property") { if (isCurrentNativeLoad()) refreshTracks() }
+        when (property) {
+            "sid", "aid", "vid" -> postNativeEvent("property $property") {
+                if (isCurrentNativeLoad()) refreshTracks()
+            }
+            "sub-text/ass" -> postNativeEvent("property sub-text/ass") {
+                if (isCurrentNativeLoad()) emit(
+                    MpvEngineEvent(MpvEngineEvent.Kind.SUBTITLE_TEXT_CHANGED, subtitleText = value),
+                )
+            }
         }
     }
 
@@ -449,8 +521,12 @@ class LibMpvEngine(
             }
             stage("subtitle fonts")
             ensureSubtitleFont()
+            val subtitleFontsDirectory = ensureSubtitleFontsDirectory()
             check(core.setOptionString("config-dir", appContext.filesDir.absolutePath) >= 0) {
                 "Unsupported mpv option: config-dir"
+            }
+            check(core.setOptionString("sub-fonts-dir", subtitleFontsDirectory.absolutePath) >= 0) {
+                "Unsupported mpv option: sub-fonts-dir"
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 ContextCompat.getDisplayOrDefault(appContext).mode.refreshRate
@@ -491,7 +567,7 @@ class LibMpvEngine(
                 }
             }
             MPV.mpvEvent.MPV_EVENT_SEEK -> if (isCurrentNativeLoad()) {
-                emit(VlcEngineEvent(VlcEngineEvent.Kind.BUFFERING, positionMs = positionMs))
+                emit(MpvEngineEvent(MpvEngineEvent.Kind.BUFFERING, positionMs = positionMs))
             }
             MPV.mpvEvent.MPV_EVENT_PLAYBACK_RESTART -> if (isCurrentNativeLoad()) {
                 publishPlaybackPhase(firstFrameRendered = true)
@@ -513,7 +589,7 @@ class LibMpvEngine(
         if (lease != null && resolvedEntryId != null) leasesByEntryId[resolvedEntryId] = lease
         if (lease !== activeLease || (activeEntryId != null && resolvedEntryId != activeEntryId)) return
         fileLoaded = false
-        emit(VlcEngineEvent(VlcEngineEvent.Kind.OPENING, positionMs = positionMs))
+        emit(MpvEngineEvent(MpvEngineEvent.Kind.OPENING, positionMs = positionMs))
     }
 
     private fun onFileLoaded() {
@@ -550,9 +626,9 @@ class LibMpvEngine(
         activeEntryId = null
         fileLoaded = false
         when (data["reason"]?.asString()) {
-            "eof" -> emit(VlcEngineEvent(VlcEngineEvent.Kind.END_REACHED, positionMs = positionMs))
+            "eof" -> emit(MpvEngineEvent(MpvEngineEvent.Kind.END_REACHED, positionMs = positionMs))
             "error" -> emitPlaybackError(IOException("libmpv could not decode this media"))
-            else -> emit(VlcEngineEvent(VlcEngineEvent.Kind.STOPPED, positionMs = positionMs))
+            else -> emit(MpvEngineEvent(MpvEngineEvent.Kind.STOPPED, positionMs = positionMs))
         }
     }
 
@@ -561,21 +637,21 @@ class LibMpvEngine(
         when (property) {
             "time-pos" -> {
                 positionMs = secondsToMs(value)
-                emit(VlcEngineEvent(VlcEngineEvent.Kind.TIME_CHANGED, positionMs = positionMs))
+                emit(MpvEngineEvent(MpvEngineEvent.Kind.TIME_CHANGED, positionMs = positionMs))
             }
             "duration" -> {
                 durationMs = secondsToMs(value)
-                emit(VlcEngineEvent(VlcEngineEvent.Kind.LENGTH_CHANGED, durationMs = durationMs))
+                emit(MpvEngineEvent(MpvEngineEvent.Kind.LENGTH_CHANGED, durationMs = durationMs))
             }
             "cache-buffering-state" -> if (value < 100.0) {
-                emit(VlcEngineEvent(VlcEngineEvent.Kind.BUFFERING, bufferingPercent = value.toFloat()))
+                emit(MpvEngineEvent(MpvEngineEvent.Kind.BUFFERING, bufferingPercent = value.toFloat()))
             }
         }
     }
 
     private fun handleLongProperty(property: String, value: Long) {
         if (property == "cache-buffering-state" && value < 100L) {
-            emit(VlcEngineEvent(VlcEngineEvent.Kind.BUFFERING, bufferingPercent = value.toFloat()))
+            emit(MpvEngineEvent(MpvEngineEvent.Kind.BUFFERING, bufferingPercent = value.toFloat()))
         }
     }
 
@@ -583,23 +659,23 @@ class LibMpvEngine(
         when (property) {
             "pause" -> if (fileLoaded && mpv?.getPropertyBoolean("paused-for-cache") != true) {
                 emit(
-                    VlcEngineEvent(
-                        if (value) VlcEngineEvent.Kind.PAUSED else VlcEngineEvent.Kind.PLAYING,
+                    MpvEngineEvent(
+                        if (value) MpvEngineEvent.Kind.PAUSED else MpvEngineEvent.Kind.PLAYING,
                         positionMs = positionMs,
                     ),
                 )
             }
             "paused-for-cache", "seeking" -> if (value) {
-                emit(VlcEngineEvent(VlcEngineEvent.Kind.BUFFERING, positionMs = positionMs))
+                emit(MpvEngineEvent(MpvEngineEvent.Kind.BUFFERING, positionMs = positionMs))
             } else if (fileLoaded) {
                 publishPlaybackPhase()
             }
             "seekable" -> {
                 seekable = value
-                emit(VlcEngineEvent(VlcEngineEvent.Kind.SEEKABLE_CHANGED, seekable = value))
+                emit(MpvEngineEvent(MpvEngineEvent.Kind.SEEKABLE_CHANGED, seekable = value))
             }
             "eof-reached" -> if (value) {
-                emit(VlcEngineEvent(VlcEngineEvent.Kind.END_REACHED, positionMs = positionMs))
+                emit(MpvEngineEvent(MpvEngineEvent.Kind.END_REACHED, positionMs = positionMs))
             }
         }
     }
@@ -608,12 +684,12 @@ class LibMpvEngine(
         val core = mpv ?: return
         val kind = when {
             core.getPropertyBoolean("paused-for-cache") == true ||
-                core.getPropertyBoolean("seeking") == true -> VlcEngineEvent.Kind.BUFFERING
-            core.getPropertyBoolean("pause") == true -> VlcEngineEvent.Kind.PAUSED
-            else -> VlcEngineEvent.Kind.PLAYING
+                core.getPropertyBoolean("seeking") == true -> MpvEngineEvent.Kind.BUFFERING
+            core.getPropertyBoolean("pause") == true -> MpvEngineEvent.Kind.PAUSED
+            else -> MpvEngineEvent.Kind.PLAYING
         }
         emit(
-            VlcEngineEvent(
+            MpvEngineEvent(
                 kind = kind,
                 // PLAYBACK_RESTART is also emitted for the first paused frame after prepare/seek.
                 firstFrameRendered = firstFrameRendered,
@@ -634,14 +710,16 @@ class LibMpvEngine(
         subtitles: List<OpenedMpvSubtitle> = activeSubtitles,
     ) {
         subtitles.forEach { subtitle ->
-            val addMode = mpvSubtitleAddMode(subtitle.metadata.selectionFlags)
-            val title = subtitle.metadata.id?.takeIf(String::isNotBlank)
-                ?: subtitle.metadata.label?.takeIf(String::isNotBlank)
+            val addMode = mpvSubtitleAddMode(subtitle.metadata.isDefault)
+            val title = subtitle.metadata.label?.takeIf(String::isNotBlank)
+                ?: subtitle.metadata.id?.takeIf(String::isNotBlank)
                 ?: subtitle.metadata.uri.lastPathSegment.orEmpty()
             if (addMode == "select") {
                 // `sid` and subtitle visibility are separate MPV properties. A user-selected
                 // sidecar must recover from either an embedded track or a previous "off" choice.
-                core.setPropertyBoolean("sub-visibility", true)
+                // Text tracks use the Compose overlay so Noir's layout controls remain exact;
+                // bitmap tracks contain already-rendered pixels and must stay native.
+                core.setPropertyBoolean("sub-visibility", subtitle.isBitmap())
             }
             core.command(
                 "sub-add",
@@ -663,50 +741,49 @@ class LibMpvEngine(
             val map = entry.asMap() ?: return@mapNotNull null
             val id = map.long("id")?.toInt() ?: return@mapNotNull null
             val type = when (map.string("type")) {
-                "audio" -> VlcTrackType.AUDIO
-                "video" -> VlcTrackType.VIDEO
-                "sub" -> VlcTrackType.TEXT
-                else -> VlcTrackType.UNKNOWN
+                "audio" -> MpvTrackType.AUDIO
+                "video" -> MpvTrackType.VIDEO
+                "sub" -> MpvTrackType.SUBTITLE
+                else -> MpvTrackType.UNKNOWN
             }
-            if (type == VlcTrackType.UNKNOWN) return@mapNotNull null
+            if (type == MpvTrackType.UNKNOWN) return@mapNotNull null
             val title = map.string("title")
             val externalFilename = map.string("external-filename")
             val externalId = configuredSubtitles.firstOrNull { subtitle ->
                 externalTrackMatches(subtitle, title, externalFilename)
             }?.id
-            VlcTrackInfo(
+            MpvTrackInfo(
                 id = id,
                 type = type,
                 codec = map.string("codec"),
                 originalCodec = map.string("codec-desc"),
-                bitrate = map.long("demux-bitrate")?.coerceAtMost(Int.MAX_VALUE.toLong())?.toInt()
-                    ?: Format.NO_VALUE,
+                bitrate = map.long("demux-bitrate")?.coerceAtMost(Int.MAX_VALUE.toLong())?.toInt(),
                 language = map.string("lang"),
                 description = map.string("codec-desc"),
                 label = title,
-                selectionFlags = (if (map.boolean("default") == true) C.SELECTION_FLAG_DEFAULT else 0) or
-                    (if (map.boolean("forced") == true) C.SELECTION_FLAG_FORCED else 0),
-                roleFlags = (if (map.boolean("hearing-impaired") == true) C.ROLE_FLAG_CAPTION else 0) or
-                    (if (map.boolean("visual-impaired") == true) C.ROLE_FLAG_DESCRIBES_VIDEO else 0) or
-                    (if (map.boolean("commentary") == true) C.ROLE_FLAG_COMMENTARY else 0),
+                isDefault = map.boolean("default") == true,
+                isForced = map.boolean("forced") == true,
+                isHearingImpaired = map.boolean("hearing-impaired") == true,
+                isVisualImpaired = map.boolean("visual-impaired") == true,
+                isCommentary = map.boolean("commentary") == true,
                 externalId = externalId,
-                width = map.long("demux-w")?.toInt() ?: Format.NO_VALUE,
-                height = map.long("demux-h")?.toInt() ?: Format.NO_VALUE,
-                sampleRate = map.long("demux-samplerate")?.toInt() ?: Format.NO_VALUE,
+                width = map.long("demux-w")?.toInt(),
+                height = map.long("demux-h")?.toInt(),
+                sampleRate = map.long("demux-samplerate")?.toInt(),
                 channelCount = map.long("demux-channel-count")?.toInt()
                     ?: parseChannelCount(map.string("audio-channels")),
-                frameRate = map.double("demux-fps")?.toFloat() ?: Format.NO_VALUE.toFloat(),
+                frameRate = map.double("demux-fps")?.toFloat(),
                 pixelWidthHeightRatio = map.double("demux-par")?.toFloat()?.takeIf { it > 0f } ?: 1f,
                 rotationDegrees = map.long("demux-rotation")?.toInt() ?: 0,
             )
         }
-        snapshot = VlcTrackSnapshot(
+        snapshot = MpvTrackSnapshot(
             tracks = mapped,
             selectedAudioId = selectedTrackId(core, "aid"),
             selectedVideoId = selectedTrackId(core, "vid"),
-            selectedTextId = selectedTrackId(core, "sid"),
+            selectedSubtitleId = selectedTrackId(core, "sid"),
         )
-        emit(VlcEngineEvent(VlcEngineEvent.Kind.TRACKS_CHANGED, tracks = snapshot))
+        emit(MpvEngineEvent(MpvEngineEvent.Kind.TRACKS_CHANGED, tracks = snapshot))
     }
 
     private fun refreshVideoSize() {
@@ -727,9 +804,9 @@ class LibMpvEngine(
             ?.let { (it / (width.toDouble() / height)).toFloat() }
             ?: 1f
         emit(
-            VlcEngineEvent(
-                VlcEngineEvent.Kind.VOUT,
-                videoSize = VlcVideoSize(width, height, ratio, map.long("rotate")?.toInt() ?: 0),
+            MpvEngineEvent(
+                MpvEngineEvent.Kind.VOUT,
+                videoSize = MpvVideoSize(width, height, ratio, map.long("rotate")?.toInt() ?: 0),
             ),
         )
     }
@@ -757,9 +834,9 @@ class LibMpvEngine(
             if (width > 0 && height > 0) {
                 core.setPropertyString("android-surface-size", "${width}x$height")
                 emit(
-                    VlcEngineEvent(
-                        VlcEngineEvent.Kind.SURFACE_SIZE_CHANGED,
-                        surfaceSize = VlcSurfaceSize(width, height),
+                    MpvEngineEvent(
+                        MpvEngineEvent.Kind.SURFACE_SIZE_CHANGED,
+                        surfaceSize = MpvSurfaceSize(width, height),
                     ),
                 )
             }
@@ -820,7 +897,7 @@ class LibMpvEngine(
         activeLease = null
         activeEntryId = null
         configuredSubtitles = emptyList()
-        snapshot = VlcTrackSnapshot()
+        snapshot = MpvTrackSnapshot()
     }
 
     private fun closeSources() {
@@ -845,14 +922,16 @@ class LibMpvEngine(
     }
 
     private fun openSource(uri: Uri): OpenedMpvSource {
-        if (uri.scheme.equals("syncplaysmb", ignoreCase = true)) {
-            throw IOException("Direct SMB is handled by AndroidX Media3; use a system SMB document provider for MPV")
+        if (SmbUri.isSmbUri(uri)) {
+            // The SMB adapter owns the random-access handle/proxy and must outlive native demuxing.
+            val smbSource = SmbPlaybackEnvironment.openMpvSource(uri)
+            return OpenedMpvSource(location = smbSource.location, lease = smbSource)
         }
         return openMpvLocation(appContext.contentResolver, uri)
     }
 
     private fun openSubtitle(
-        subtitle: VlcExternalSubtitle,
+        subtitle: MpvExternalSubtitle,
         job: SubtitleLoadJob,
     ): OpenedMpvSubtitle = OpenedMpvSubtitle(
         subtitle,
@@ -866,19 +945,22 @@ class LibMpvEngine(
 
     private fun scheduleSubtitleLoad(
         generation: Long,
-        subtitles: List<VlcExternalSubtitle>,
+        subtitles: List<MpvExternalSubtitle>,
     ) {
         if (subtitles.isEmpty() || released || generation != mediaGeneration.get()) return
         val job = SubtitleLoadJob()
         subtitleLoad.getAndSet(job)?.cancel()
         val future = subtitleExecutor.submit {
             val opened = mutableListOf<OpenedMpvSubtitle>()
+            var firstFailure: Throwable? = null
             var transferred = false
             try {
                 for (subtitle in subtitles) {
                     if (job.isCancelled() || generation != mediaGeneration.get()) break
                     // A stale or inaccessible sidecar is non-fatal to the movie itself.
-                    runCatching { openSubtitle(subtitle, job) }.getOrNull()?.let(opened::add)
+                    runCatching { openSubtitle(subtitle, job) }
+                        .onSuccess(opened::add)
+                        .onFailure { error -> if (firstFailure == null) firstFailure = error }
                 }
                 if (job.isCancelled() || generation != mediaGeneration.get()) return@submit
                 transferred = commandHandler.post {
@@ -901,6 +983,14 @@ class LibMpvEngine(
                             }
                         }
                         else -> opened.forEach(OpenedMpvSubtitle::close)
+                    }
+                    if (opened.isEmpty() && subtitles.isNotEmpty() && firstFailure != null) {
+                        emit(
+                            MpvEngineEvent(
+                                MpvEngineEvent.Kind.EXTERNAL_SUBTITLE_LOAD_FAILED,
+                                error = IOException("Unable to load the selected subtitle", firstFailure),
+                            ),
+                        )
                     }
                 }
             } finally {
@@ -941,13 +1031,13 @@ class LibMpvEngine(
         }
     }
 
-    private fun emit(event: VlcEngineEvent) {
+    private fun emit(event: MpvEngineEvent) {
         val callback = listener ?: return
         eventHandler.post { if (!released && listener === callback) callback(event) }
     }
 
     private fun emitPlaybackError(error: Throwable) {
-        emit(VlcEngineEvent(VlcEngineEvent.Kind.ENCOUNTERED_ERROR, error = error))
+        emit(MpvEngineEvent(MpvEngineEvent.Kind.ENCOUNTERED_ERROR, error = error))
     }
 
     private fun stage(name: String) {
@@ -979,6 +1069,9 @@ class LibMpvEngine(
         }
         return destination
     }
+
+    private fun ensureSubtitleFontsDirectory(): File =
+        File(appContext.filesDir, "mpv/fonts").apply { mkdirs() }
 
     private fun secondsToMs(value: Double): Long = (value * 1_000.0).toLong().coerceAtLeast(0L)
     private fun seconds(valueMs: Long): Double = valueMs / 1_000.0
@@ -1016,6 +1109,7 @@ class LibMpvEngine(
             "demuxer-max-back-bytes" to "33554432",
             "sub-auto" to "no",
             "sub-ass" to "yes",
+            "sub-ass-override" to "force",
             "embeddedfonts" to "yes",
             "osc" to "no",
             "osd-level" to "0",
@@ -1035,6 +1129,9 @@ class LibMpvEngine(
             "eof-reached" to MPV.mpvFormat.MPV_FORMAT_FLAG,
             "cache-buffering-state" to MPV.mpvFormat.MPV_FORMAT_DOUBLE,
             "track-list" to MPV.mpvFormat.MPV_FORMAT_NODE,
+            // ASS text retains simple bold/italic/underline/color markup. MPV still decodes it
+            // while native subtitle visibility is disabled for the Compose caption overlay.
+            "sub-text/ass" to MPV.mpvFormat.MPV_FORMAT_STRING,
             "sid" to MPV.mpvFormat.MPV_FORMAT_STRING,
             "aid" to MPV.mpvFormat.MPV_FORMAT_STRING,
             "vid" to MPV.mpvFormat.MPV_FORMAT_STRING,
@@ -1049,19 +1146,24 @@ data class OpenedMpvSource(
     val location: String,
     private val descriptor: ParcelFileDescriptor? = null,
     private val temporaryFile: File? = null,
+    /** Keeps a provider/SMB bridge alive until the matching native END_FILE. */
+    private val lease: Closeable? = null,
 ) : Closeable {
     override fun close() {
-        descriptor?.close()
-        temporaryFile?.delete()
+        runCatching { descriptor?.close() }
+        runCatching { temporaryFile?.delete() }
+        runCatching { lease?.close() }
     }
 }
 
 private data class OpenedMpvSubtitle(
-    val metadata: VlcExternalSubtitle,
+    val metadata: MpvExternalSubtitle,
     val source: OpenedMpvSource,
 ) : Closeable {
     override fun close() = source.close()
 }
+
+private fun OpenedMpvSubtitle.isBitmap(): Boolean = subtitleExtension(metadata) in BITMAP_SUBTITLE_EXTENSIONS
 
 /** Descriptor ownership for one loadfile request; close is intentionally idempotent. */
 private class MpvSourceLease(
@@ -1183,29 +1285,31 @@ private fun openMpvContentLocation(
  * `sub-add` discards the name, which can make ASS/SRT probing unreliable. Movies never take this
  * path, so a multi-gigabyte video is not copied into app storage.
  */
-@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 internal fun openMpvSubtitleLocation(
     context: Context,
-    subtitle: VlcExternalSubtitle,
+    subtitle: MpvExternalSubtitle,
     isCancelled: () -> Boolean = { false },
     onInputOpened: (InputStream) -> Unit = {},
 ): OpenedMpvSource {
     if (isCancelled()) throw InterruptedIOException("Subtitle loading was cancelled")
     val uri = subtitle.uri
-    if (!uri.scheme.equals(ContentResolver.SCHEME_CONTENT, ignoreCase = true) && !SmbUri.isSmbUri(uri)) {
+    val extension = subtitleExtension(subtitle)
+    val mustMaterialize = uri.scheme.equals(ContentResolver.SCHEME_CONTENT, ignoreCase = true) ||
+        SmbUri.isSmbUri(uri) || extension == "zip"
+    if (!mustMaterialize) {
         return openMpvLocation(context.contentResolver, uri)
     }
-    val extension = subtitleExtension(subtitle)
     val destination = File.createTempFile("syncplay-subtitle-", ".$extension", context.cacheDir)
+    var extracted: File? = null
     try {
-        val input: InputStream = if (SmbUri.isSmbUri(uri)) {
-            DataSourceInputStream(
-                SmbPlaybackEnvironment.dataSourceFactory(context).createDataSource(),
-                DataSpec(uri),
-            ).apply { open() }
-        } else {
-            context.contentResolver.openInputStream(uri)
-                ?: throw IOException("Android document provider returned no subtitle stream")
+        val input: InputStream = when {
+            SmbUri.isSmbUri(uri) -> SmbPlaybackEnvironment.openInputStream(uri)
+            uri.scheme.equals(ContentResolver.SCHEME_CONTENT, ignoreCase = true) ->
+                context.contentResolver.openInputStream(uri)
+                    ?: throw IOException("Android document provider returned no subtitle stream")
+            uri.scheme.equals(ContentResolver.SCHEME_FILE, ignoreCase = true) ->
+                File(uri.path ?: throw IOException("Subtitle file URI has no path")).inputStream()
+            else -> throw IOException("ZIP subtitles must come from an Android, file, or SMB URI")
         }
         onInputOpened(input)
         if (isCancelled()) throw InterruptedIOException("Subtitle loading was cancelled")
@@ -1227,12 +1331,96 @@ internal fun openMpvSubtitleLocation(
             }
         }
         if (isCancelled()) throw InterruptedIOException("Subtitle loading was cancelled")
-        return OpenedMpvSource(destination.absolutePath, temporaryFile = destination)
+        val materialized = if (extension == "zip") {
+            extractFirstTextSubtitle(destination, context.cacheDir, isCancelled).also { extracted = it }
+        } else {
+            destination
+        }
+        validateMaterializedSubtitle(materialized)
+        if (materialized !== destination) destination.delete()
+        return OpenedMpvSource(materialized.absolutePath, temporaryFile = materialized)
     } catch (error: Throwable) {
         destination.delete()
+        extracted?.delete()
         if (error is IOException) throw error
         throw IOException("Unable to cache external subtitle", error)
     }
+}
+
+private fun extractFirstTextSubtitle(
+    archive: File,
+    cacheDirectory: File,
+    isCancelled: () -> Boolean,
+): File {
+    ZipInputStream(archive.inputStream().buffered()).use { zip ->
+        var entriesScanned = 0
+        while (entriesScanned < MAX_ZIP_ENTRIES) {
+            if (isCancelled()) throw InterruptedIOException("Subtitle loading was cancelled")
+            val entry = zip.nextEntry ?: break
+            entriesScanned++
+            val extension = entry.name.substringAfterLast('.', "").lowercase(Locale.ROOT)
+            if (!entry.isDirectory && extension in ARCHIVE_SUBTITLE_EXTENSIONS) {
+                val target = File.createTempFile("syncplay-subtitle-zip-", ".$extension", cacheDirectory)
+                try {
+                    target.outputStream().buffered().use { output ->
+                        copySubtitleStream(zip, output, isCancelled)
+                    }
+                    return target
+                } catch (error: Throwable) {
+                    target.delete()
+                    throw error
+                }
+            }
+            zip.closeEntry()
+        }
+    }
+    throw IOException("The ZIP archive contains no SRT, VTT, ASS, or SSA subtitle")
+}
+
+private fun copySubtitleStream(
+    input: InputStream,
+    output: java.io.OutputStream,
+    isCancelled: () -> Boolean,
+) {
+    val buffer = ByteArray(SUBTITLE_COPY_BUFFER_BYTES)
+    var total = 0L
+    while (true) {
+        if (isCancelled()) throw InterruptedIOException("Subtitle loading was cancelled")
+        val count = input.read(buffer)
+        if (count < 0) break
+        if (count == 0) continue
+        total += count
+        if (total > MAX_EXTERNAL_SUBTITLE_BYTES) {
+            throw IOException("External subtitle is larger than the supported limit")
+        }
+        output.write(buffer, 0, count)
+    }
+}
+
+private fun validateMaterializedSubtitle(file: File) {
+    if (!file.isFile || file.length() <= 0L) throw IOException("The selected subtitle is empty")
+    val extension = file.extension.lowercase(Locale.ROOT)
+    if (extension !in TEXT_SUBTITLE_EXTENSIONS) return
+    val sample = file.inputStream().buffered().use { input ->
+        val output = java.io.ByteArrayOutputStream(minOf(file.length(), SUBTITLE_VALIDATION_BYTES.toLong()).toInt())
+        val buffer = ByteArray(16 * 1024)
+        var remaining = SUBTITLE_VALIDATION_BYTES
+        while (remaining > 0) {
+            val count = input.read(buffer, 0, minOf(buffer.size, remaining))
+            if (count < 0) break
+            if (count == 0) continue
+            output.write(buffer, 0, count)
+            remaining -= count
+        }
+        output.toString(Charsets.UTF_8.name())
+    }
+    val valid = when (extension) {
+        "srt", "vtt" -> TIMED_SUBTITLE_CUE.containsMatchIn(sample)
+        "ass", "ssa" -> ASS_SUBTITLE_CUE.containsMatchIn(sample)
+        "ttml", "xml" -> TTML_SUBTITLE_CUE.containsMatchIn(sample)
+        else -> true
+    }
+    if (!valid) throw IOException("The selected subtitle contains no valid timed cues")
 }
 
 private fun ensureSeekable(descriptor: ParcelFileDescriptor) {
@@ -1244,7 +1432,7 @@ private fun ensureSeekable(descriptor: ParcelFileDescriptor) {
     }
 }
 
-private fun subtitleExtension(subtitle: VlcExternalSubtitle): String {
+internal fun subtitleExtension(subtitle: MpvExternalSubtitle): String {
     val pathExtension = listOfNotNull(subtitle.label, subtitle.uri.lastPathSegment)
         .asSequence()
         .map { Uri.decode(it).substringAfterLast('.', missingDelimiterValue = "").lowercase(Locale.ROOT) }
@@ -1254,6 +1442,9 @@ private fun subtitleExtension(subtitle: VlcExternalSubtitle): String {
         "text/x-ssa", "text/x-ass", "application/x-ass", "application/x-ssa" -> "ass"
         "text/vtt" -> "vtt"
         "application/ttml+xml" -> "ttml"
+        "application/pgs" -> "sup"
+        "application/x-vobsub" -> "idx"
+        "application/zip", "application/x-zip-compressed" -> "zip"
         else -> "srt"
     }
 }
@@ -1264,12 +1455,11 @@ internal fun fdMrlForDescriptor(fd: Int): String {
     return "fd://$fd"
 }
 
-/** Translate Media3's default sidecar intent to MPV's explicit add/select semantics. */
-internal fun mpvSubtitleAddMode(selectionFlags: Int): String =
-    if (selectionFlags and C.SELECTION_FLAG_DEFAULT != 0) "select" else "auto"
+/** Translate a sidecar's default intent to MPV's explicit add/select semantics. */
+internal fun mpvSubtitleAddMode(isDefault: Boolean): String = if (isDefault) "select" else "auto"
 
 internal fun externalTrackMatches(
-    subtitle: VlcExternalSubtitle,
+    subtitle: MpvExternalSubtitle,
     title: String?,
     externalFilename: String?,
 ): Boolean {
@@ -1332,7 +1522,7 @@ private fun decodeUriComponent(value: String): String {
     return result.toString()
 }
 
-private fun parseChannelCount(channels: String?): Int = when (channels?.trim()?.lowercase(Locale.ROOT)) {
+private fun parseChannelCount(channels: String?): Int? = when (channels?.trim()?.lowercase(Locale.ROOT)) {
     "mono" -> 1
     "stereo" -> 2
     "2.1", "3.0" -> 3
@@ -1341,7 +1531,7 @@ private fun parseChannelCount(channels: String?): Int = when (channels?.trim()?.
     "5.1" -> 6
     "6.1" -> 7
     "7.1" -> 8
-    else -> Format.NO_VALUE
+    else -> null
 }
 
 private fun Map<String, MPVNode>.string(key: String): String? = get(key)?.asString()
@@ -1355,4 +1545,16 @@ private fun Map<String, MPVNode>.boolean(key: String): Boolean? = get(key)?.asBo
 
 private const val SUBTITLE_COPY_BUFFER_BYTES = 64 * 1024
 private const val MAX_EXTERNAL_SUBTITLE_BYTES = 64L * 1024L * 1024L
-private val SUPPORTED_SUBTITLE_EXTENSIONS = setOf("srt", "ass", "ssa", "vtt", "ttml")
+private const val SUBTITLE_VALIDATION_BYTES = 2 * 1024 * 1024
+private const val MAX_ZIP_ENTRIES = 1_024
+private val TEXT_SUBTITLE_EXTENSIONS = setOf("srt", "ass", "ssa", "vtt", "ttml", "xml")
+private val ARCHIVE_SUBTITLE_EXTENSIONS = setOf("srt", "ass", "ssa", "vtt")
+private val BITMAP_SUBTITLE_EXTENSIONS = setOf("sup", "pgs", "idx", "sub")
+private val SUPPORTED_SUBTITLE_EXTENSIONS =
+    TEXT_SUBTITLE_EXTENSIONS + ARCHIVE_SUBTITLE_EXTENSIONS + BITMAP_SUBTITLE_EXTENSIONS + "zip"
+private val TIMED_SUBTITLE_CUE = Regex(
+    "(?m)^[^\\n]*\\d{1,3}:\\d{2}(?::\\d{2})?[,.]\\d{1,3}\\s*-->\\s*" +
+        "\\d{1,3}:\\d{2}(?::\\d{2})?[,.]\\d{1,3}",
+)
+private val ASS_SUBTITLE_CUE = Regex("(?im)^\\s*Dialogue\\s*:")
+private val TTML_SUBTITLE_CUE = Regex("(?is)<(?:tt|p)(?:\\s|>)")

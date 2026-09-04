@@ -1,9 +1,9 @@
 # Third-party notices
 
-Syncplay Droid 0.3.4 includes `io.github.abdallahmehiz:mpv-android-lib:0.1.12` for its optional
-high-performance playback backend. The Android wrapper is licensed under the MIT License. Its AAR
-contains native mpv, FFmpeg, libass, and related libraries; the distributed native build enables
-GPL and version-3 components. Those components remain under their respective upstream licenses.
+Syncplay Droid 0.4.0 uses `io.github.abdallahmehiz:mpv-android-lib:0.1.12` as its sole media
+playback engine. The Android wrapper is licensed under the MIT License. Its AAR contains native
+mpv, FFmpeg, libass, and related libraries; the distributed native build enables GPL and version-3
+components. Those components remain under their respective upstream licenses.
 
 - mpv-android-lib source (exact tag):
   https://github.com/abdallahmehiz/mpv-android/tree/v0.1.12
@@ -21,7 +21,7 @@ terms governing this distribution.
 
 Other principal dependencies retain their own licenses:
 
-- AndroidX Media3 and other AndroidX libraries: Apache License 2.0.
+- AndroidX libraries used for Compose UI and Android platform integration: Apache License 2.0.
 - SMBJ: Apache License 2.0.
 - Gson: Apache License 2.0.
 - Kotlin and kotlinx.coroutines: Apache License 2.0.

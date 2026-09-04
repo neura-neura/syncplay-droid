@@ -5,6 +5,7 @@ import android.graphics.Color
 import androidx.activity.SystemBarStyle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
@@ -73,6 +74,14 @@ private fun SyncplayRoot(
             picked?.let { viewModel.addSubtitle(it.uri, it.grantFlags) }
         },
     )
+    val srtExportPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/x-subrip"),
+        onResult = { destination -> destination?.let(viewModel::exportCurrentSubtitle) },
+    )
+    val vttExportPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("text/vtt"),
+        onResult = { destination -> destination?.let(viewModel::exportCurrentSubtitle) },
+    )
 
     when {
         !state.settingsLoaded -> LoadingScreen()
@@ -93,7 +102,24 @@ private fun SyncplayRoot(
             onChangeRoom = viewModel::changeRoom,
             onDisconnect = viewModel::disconnect,
             onDismissPlaybackError = viewModel::clearPlaybackError,
-            onSetPlaybackEngine = viewModel::setPlaybackEnginePreference,
+            onTogglePlayback = viewModel::togglePlayback,
+            onSeekTo = viewModel::seekTo,
+            onSeekBy = viewModel::seekBy,
+            onAttachVideoOutput = viewModel::attachVideoOutput,
+            onClearVideoOutput = viewModel::clearVideoOutput,
+            onSubtitleAppearanceChange = viewModel::updateSubtitleAppearance,
+            onSubtitleSyncChange = viewModel::updateSubtitleSync,
+            onAlignSubtitleCue = viewModel::alignSubtitleCue,
+            onExportSubtitle = { fileName ->
+                if (fileName.endsWith(".vtt", ignoreCase = true)) {
+                    vttExportPicker.launch(fileName)
+                } else {
+                    srtExportPicker.launch(fileName)
+                }
+            },
+            onRemoteFontCssUrlChange = viewModel::updateRemoteFontCssUrl,
+            onLoadRemoteFontCss = viewModel::loadRemoteSubtitleFont,
+            onResetSubtitleAppearance = viewModel::resetSubtitleAppearance,
         )
         else -> ConnectionScreen(
             state = state,

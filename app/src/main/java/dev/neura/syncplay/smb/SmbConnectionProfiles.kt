@@ -1,9 +1,8 @@
 package dev.neura.syncplay.smb
 
-import android.content.Context
-import android.annotation.SuppressLint
-import androidx.media3.datasource.DataSource
+import android.net.Uri
 import java.io.Closeable
+import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -12,7 +11,7 @@ import java.util.concurrent.ConcurrentHashMap
  * The registry intentionally has no persistence mechanism.  Registering a profile copies its
  * secret, replacing/removing a profile wipes the old character array, and callers can only obtain
  * password-free summaries.  Playback URIs carry the opaque profile id and therefore remain safe to
- * put in MediaItem metadata or Syncplay diagnostics.
+ * put in media metadata or Syncplay diagnostics.
  */
 class SmbConnectionProfileRegistry {
     private val profiles = ConcurrentHashMap<String, SmbConnectionProfile>()
@@ -73,12 +72,25 @@ class SmbConnectionProfileRegistry {
 object SmbPlaybackEnvironment : Closeable {
     val registry: SmbConnectionProfileRegistry = SmbConnectionProfileRegistry()
     val directoryRepository: SmbDirectoryRepository = SmbDirectoryRepository(registry)
+    private val activeMpvSources = Collections.newSetFromMap(
+        ConcurrentHashMap<SmbMpvSource, Boolean>(),
+    )
 
-    @SuppressLint("UnsafeOptInUsageError") // The custom factory implements Media3's unstable DataSource API.
-    fun dataSourceFactory(context: Context): DataSource.Factory =
-        SmbRoutingDataSourceFactory(context, registry)
+    /**
+     * Open [uri] for libmpv. The returned URL is loopback-only and contains an opaque token; the
+     * source remains valid until its [SmbMpvSource.close] method is called.
+     */
+    fun openMpvSource(uri: Uri): SmbMpvSource = openSmbMpvSource(uri, registry).also { source ->
+        source.onClosed = { activeMpvSources -= it }
+        activeMpvSources += source
+    }
+
+    /** Open [uri] as a sequential stream for subtitle/metadata readers. */
+    fun openInputStream(uri: Uri): java.io.InputStream = openSmbInputStream(uri, registry)
 
     override fun close() {
+        activeMpvSources.toList().forEach { source -> runCatching { source.close() } }
+        activeMpvSources.clear()
         directoryRepository.close()
         registry.clear()
     }

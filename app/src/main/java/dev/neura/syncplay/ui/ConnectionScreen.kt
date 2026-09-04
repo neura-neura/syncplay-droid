@@ -138,7 +138,7 @@ fun ConnectionScreen(
                         .fillMaxWidth(),
                 ) {
                     Text(
-                        text = "SYNCPLAY / MEDIA3",
+                        text = "SYNCPLAY / MPV",
                         style = MaterialTheme.typography.labelLarge,
                         color = Cyan,
                     )

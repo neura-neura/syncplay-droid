@@ -6,7 +6,7 @@ import java.util.Locale
  * Credentials and endpoint information for one SMB server.
  *
  * Profiles are deliberately process-local.  The password is copied into a private character
- * array and is never part of the URI used by Media3.  [toString] is also redacted because profile
+ * array and is never part of the loopback URI used by MPV. [toString] is also redacted because profile
  * objects are frequently included in debug values while building a browser screen.
  */
 class SmbConnectionProfile(

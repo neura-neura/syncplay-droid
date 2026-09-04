@@ -1,12 +1,11 @@
-package dev.neura.syncplay.player.vlc
+package dev.neura.syncplay.player.mpv
 
-import androidx.media3.common.C
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-class VlcSourceUriTest {
+class MpvSourceUriTest {
     @Test
     fun subtitleNamesMatchLabelsAndDecodedFileNames() {
         assertTrue(subtitleMetadataMatches("external-1", null, "external-1", "Spanish", "Sub Title.srt"))
@@ -22,12 +21,8 @@ class VlcSourceUriTest {
 
     @Test
     fun userSelectedExternalSubtitleUsesMpvSelectMode() {
-        assertEquals("select", mpvSubtitleAddMode(C.SELECTION_FLAG_DEFAULT))
-        assertEquals(
-            "select",
-            mpvSubtitleAddMode(C.SELECTION_FLAG_DEFAULT or C.SELECTION_FLAG_FORCED),
-        )
-        assertEquals("auto", mpvSubtitleAddMode(0))
+        assertEquals("select", mpvSubtitleAddMode(true))
+        assertEquals("auto", mpvSubtitleAddMode(false))
     }
 
     private fun assertThrows(block: () -> Unit) {
