@@ -25,12 +25,10 @@ object SystemSubtitleFontCatalog {
             runCatching { readFamilyNames(file) }.getOrDefault(emptyList()).forEach(names::add)
         }
         names.take(MAX_FAMILIES).forEach { family ->
-            val platformName = if (family == SubtitleAppearance.DEFAULT_FONT_FAMILY) {
-                "sans-serif"
-            } else {
-                family
-            }
-            runCatching { Typeface.create(platformName, Typeface.NORMAL) }
+            // Keep the Noir default visible in the picker while its remote faces load, but never
+            // register Android sans-serif under the GothamPro name: doing so hid failed loads.
+            if (SubtitleFontRegistry.isGothamPro(family)) return@forEach
+            runCatching { Typeface.create(family, Typeface.NORMAL) }
                 .getOrNull()
                 ?.let { SubtitleFontRegistry.register(family, it) }
         }

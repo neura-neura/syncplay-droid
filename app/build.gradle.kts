@@ -11,8 +11,8 @@ android {
         applicationId = "dev.neura.syncplay"
         minSdk = 23
         targetSdk = 37
-        versionCode = 11
-        versionName = "0.4.0"
+        versionCode = 13
+        versionName = "0.4.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true

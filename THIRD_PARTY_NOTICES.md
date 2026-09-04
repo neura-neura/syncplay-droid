@@ -1,6 +1,6 @@
 # Third-party notices
 
-Syncplay Droid 0.4.0 uses `io.github.abdallahmehiz:mpv-android-lib:0.1.12` as its sole media
+Syncplay Droid uses `io.github.abdallahmehiz:mpv-android-lib:0.1.12` as its sole media
 playback engine. The Android wrapper is licensed under the MIT License. Its AAR contains native
 mpv, FFmpeg, libass, and related libraries; the distributed native build enables GPL and version-3
 components. Those components remain under their respective upstream licenses.
@@ -25,6 +25,9 @@ Other principal dependencies retain their own licenses:
 - SMBJ: Apache License 2.0.
 - Gson: Apache License 2.0.
 - Kotlin and kotlinx.coroutines: Apache License 2.0.
+- The optional GothamPro preset points to an external CSS/font endpoint and stores user-retrieved
+  faces only in app-private cache. Syncplay Droid does not package or redistribute Gotham font
+  binaries; users remain responsible for having the rights required by their use.
 
 Protocol behavior was implemented from Syncplay and syncplay-noir, both distributed under the
 Apache License 2.0. See `NOTICE` for attribution.

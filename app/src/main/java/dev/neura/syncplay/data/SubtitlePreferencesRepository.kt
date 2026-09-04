@@ -28,12 +28,17 @@ private val Context.subtitlePreferencesDataStore by preferencesDataStore(
 )
 
 /**
- * Stable, schema-version-free codec for the subtitle settings file.
+ * Stable codec for the subtitle settings file.  The appearance preset marker is intentionally
+ * tiny and only exists to distinguish an untouched legacy default from a user-selected value.
  *
  * The map API is intentionally pure so malformed persisted values can be tested without an
  * Android Context. DataStore uses the same keys below and normalizes all values on read and write.
  */
 object SubtitlePreferencesCodec {
+    /** Versioned marker so a future default change does not overwrite an explicit user value. */
+    const val APPEARANCE_PRESET_VERSION_KEY = "appearance_preset_version"
+    const val CURRENT_APPEARANCE_PRESET_VERSION = 2
+
     const val FONT_SIZE_KEY = "appearance_font_size"
     const val TEXT_COLOR_KEY = "appearance_text_color"
     const val BACKGROUND_COLOR_KEY = "appearance_background_color"
@@ -58,6 +63,7 @@ object SubtitlePreferencesCodec {
         val style = normalized.appearance
         val sync = normalized.sync
         return linkedMapOf(
+            APPEARANCE_PRESET_VERSION_KEY to CURRENT_APPEARANCE_PRESET_VERSION,
             FONT_SIZE_KEY to style.fontSize,
             TEXT_COLOR_KEY to style.textColor,
             BACKGROUND_COLOR_KEY to style.backgroundColor,
@@ -83,7 +89,7 @@ object SubtitlePreferencesCodec {
         val defaults = SubtitlePreferences.DEFAULT
         val defaultStyle = defaults.appearance
         val defaultSync = defaults.sync
-        val style = SubtitleAppearance(
+        val decodedStyle = SubtitleAppearance(
             fontSize = values.floatValue(FONT_SIZE_KEY, defaultStyle.fontSize),
             textColor = values.stringValue(TEXT_COLOR_KEY, defaultStyle.textColor),
             backgroundColor = values.stringValue(BACKGROUND_COLOR_KEY, defaultStyle.backgroundColor),
@@ -100,6 +106,17 @@ object SubtitlePreferencesCodec {
             letterSpacing = values.floatValue(LETTER_SPACING_KEY, defaultStyle.letterSpacing),
             textShadow = values.booleanValue(TEXT_SHADOW_KEY, defaultStyle.textShadow),
         ).normalized()
+        // 0/absent is the unversioned 0.4.0 schema whose untouched default was 38.  Migrate only
+        // an exact legacy default; a user-selected 38 is preserved once the version marker exists.
+        val presetVersion = values.intValue(APPEARANCE_PRESET_VERSION_KEY, 0)
+        val style = if (
+            presetVersion < CURRENT_APPEARANCE_PRESET_VERSION &&
+            isUntouchedLegacyStyle(decodedStyle, defaultStyle)
+        ) {
+            decodedStyle.copy(fontSize = defaultStyle.fontSize)
+        } else {
+            decodedStyle
+        }
         val sync = SubtitleSyncSettings(
             offsetMs = values.longValue(OFFSET_MS_KEY, defaultSync.offsetMs),
             rememberOffset = values.booleanValue(REMEMBER_OFFSET_KEY, defaultSync.rememberOffset),
@@ -109,6 +126,7 @@ object SubtitlePreferencesCodec {
 
     internal fun read(preferences: Preferences): SubtitlePreferences = decode(
         mapOf(
+            APPEARANCE_PRESET_VERSION_KEY to preferences[APPEARANCE_PRESET_VERSION],
             FONT_SIZE_KEY to preferences[FONT_SIZE],
             TEXT_COLOR_KEY to preferences[TEXT_COLOR],
             BACKGROUND_COLOR_KEY to preferences[BACKGROUND_COLOR],
@@ -133,6 +151,7 @@ object SubtitlePreferencesCodec {
         val normalized = value.normalized()
         val style = normalized.appearance
         val sync = normalized.sync
+        preferences[APPEARANCE_PRESET_VERSION] = CURRENT_APPEARANCE_PRESET_VERSION
         preferences[FONT_SIZE] = style.fontSize
         preferences[TEXT_COLOR] = style.textColor
         preferences[BACKGROUND_COLOR] = style.backgroundColor
@@ -153,6 +172,7 @@ object SubtitlePreferencesCodec {
     }
 
     private val FONT_SIZE = floatPreferencesKey(FONT_SIZE_KEY)
+    private val APPEARANCE_PRESET_VERSION = intPreferencesKey(APPEARANCE_PRESET_VERSION_KEY)
     private val TEXT_COLOR = stringPreferencesKey(TEXT_COLOR_KEY)
     private val BACKGROUND_COLOR = stringPreferencesKey(BACKGROUND_COLOR_KEY)
     private val BACKGROUND_OPACITY = floatPreferencesKey(BACKGROUND_OPACITY_KEY)
@@ -169,6 +189,26 @@ object SubtitlePreferencesCodec {
     private val TEXT_SHADOW = booleanPreferencesKey(TEXT_SHADOW_KEY)
     private val OFFSET_MS = longPreferencesKey(OFFSET_MS_KEY)
     private val REMEMBER_OFFSET = booleanPreferencesKey(REMEMBER_OFFSET_KEY)
+
+    private const val LEGACY_DEFAULT_FONT_SIZE = 38f
+
+    private fun isUntouchedLegacyStyle(
+        style: SubtitleAppearance,
+        currentDefault: SubtitleAppearance,
+    ): Boolean {
+        if (style.fontSize != LEGACY_DEFAULT_FONT_SIZE) return false
+        val firstFamily = style.fontFamily
+            .substringBefore(',')
+            .trim()
+            .removeSurrounding("\"")
+            .removeSurrounding("'")
+            .replace(" ", "")
+        if (!firstFamily.equals("GothamPro", ignoreCase = true)) return false
+        return style.copy(
+            fontSize = currentDefault.fontSize,
+            fontFamily = currentDefault.fontFamily,
+        ) == currentDefault
+    }
 }
 
 /** Process-death-safe repository for subtitle appearance and synchronization settings. */

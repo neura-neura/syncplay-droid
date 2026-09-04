@@ -47,6 +47,28 @@ data class MpvExternalSubtitle(
     val isForced: Boolean = false,
 )
 
+/**
+ * A Compose-managed Android surface plus its current layout size.
+ *
+ * [androidx.compose.foundation.AndroidExternalSurface] owns the platform surface lifecycle. This
+ * handle lets MPV receive geometry changes without tearing down and recreating its OpenGL output.
+ */
+class MpvSurfaceOutput(
+    val surface: Surface,
+    width: Int,
+    height: Int,
+) {
+    @Volatile var width: Int = width
+        private set
+    @Volatile var height: Int = height
+        private set
+
+    fun updateSize(width: Int, height: Int) {
+        this.width = width
+        this.height = height
+    }
+}
+
 /** The narrow native-engine surface consumed by [MpvPlaybackSession]. */
 interface MpvPlayerEngine : Closeable {
     fun setListener(listener: ((MpvEngineEvent) -> Unit)?)
@@ -365,11 +387,20 @@ class LibMpvEngine(
     }
 
     override fun setVideoOutput(output: Any?) {
-        if (released || this.output === output) return
+        if (released) return
+        if (this.output === output) {
+            if (output is MpvSurfaceOutput) {
+                attachSurfaceAsync(output.surface, output.width, output.height)
+            }
+            return
+        }
         removeOutputCallbacks()
         detachSurfaceAsync()
         this.output = output
         when (output) {
+            is MpvSurfaceOutput -> if (output.surface.isValid) {
+                attachSurfaceAsync(output.surface, output.width, output.height)
+            }
             is SurfaceView -> {
                 output.holder.addCallback(surfaceCallback)
                 output.holder.surface.takeIf(Surface::isValid)?.let { surface ->

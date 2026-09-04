@@ -21,8 +21,8 @@ class MpvFixturePlaybackTest {
     fun libMpvParsesPlaysSeeksAndSelectsExternalSubtitleForRealMatroska() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
-        val fixture = File(context.getExternalFilesDir(null), FIXTURE_NAME)
-        assumeTrue("Provision $FIXTURE_NAME in the app external files directory", fixture.isFile)
+        val fixture = File(context.filesDir, FIXTURE_NAME)
+        assumeTrue("Provision $FIXTURE_NAME in the app files directory", fixture.isFile)
         val externalSubtitle = File(context.cacheDir, "mpv-fixture-external.srt").apply {
             writeText("1\n00:00:00,000 --> 00:00:30,000\nSyncplay external subtitle\n")
         }
@@ -116,8 +116,8 @@ class MpvFixturePlaybackTest {
     fun libMpvAutomaticallySelectsExternalAssForRealMatroska() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
-        val fixture = File(context.getExternalFilesDir(null), FIXTURE_NAME)
-        assumeTrue("Provision $FIXTURE_NAME in the app external files directory", fixture.isFile)
+        val fixture = File(context.filesDir, FIXTURE_NAME)
+        assumeTrue("Provision $FIXTURE_NAME in the app files directory", fixture.isFile)
         val externalSubtitle = File(context.cacheDir, "mpv-fixture-external.ass").apply {
             writeText(
                 """
@@ -196,8 +196,8 @@ class MpvFixturePlaybackTest {
     fun rapidReplacementIgnoresEndEventsFromOlderPlaylistEntries() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
-        val fixture = File(context.getExternalFilesDir(null), FIXTURE_NAME)
-        assumeTrue("Provision $FIXTURE_NAME in the app external files directory", fixture.isFile)
+        val fixture = File(context.filesDir, FIXTURE_NAME)
+        assumeTrue("Provision $FIXTURE_NAME in the app files directory", fixture.isFile)
 
         val newestPositionReached = CountDownLatch(1)
         val stoppedEvents = AtomicInteger(0)

@@ -2,11 +2,11 @@
   <img src="docs/logo.svg" width="180" alt="Syncplay Droid logo">
 </p>
 
-# Syncplay Droid 0.4.0
+# Syncplay Droid 0.4.2
 
 Syncplay Droid is a native Android client for watching videos in sync with people using
 [Syncplay](https://syncplay.pl/) on Windows, macOS, or Linux. It is written in Kotlin with Jetpack
-Compose and Material 3 Expressive. Version 0.4.0 is MPV-only: the bundled libmpv engine handles
+Compose and Material 3 Expressive. Version 0.4.2 is MPV-only: the bundled libmpv engine handles
 all media playback, while AndroidX libraries provide the user interface and Android platform
 integration.
 
@@ -14,7 +14,7 @@ The app speaks the standard Syncplay TCP/JSON protocol directly. Other Syncplay 
 using their own players: each client controls its local playback while the Syncplay server
 coordinates play, pause, and position.
 
-[Download Syncplay Droid 0.4.0](https://github.com/neura-neura/syncplay-droid/releases/tag/v0.4.0)
+[Download the latest published Syncplay Droid release](https://github.com/neura-neura/syncplay-droid/releases/latest)
 
 ## Features
 
@@ -42,9 +42,10 @@ coordinates play, pause, and position.
 - Customize subtitle appearance for text captions: font size, text and background colors,
   background opacity, position, maximum width, padding, weight, line height, letter spacing,
   corner radius, and text shadow. Appearance and timing preferences are stored locally.
-- Start with Noir Player's GothamPro CSS font stack (downloaded and cached from its public CDN,
-  with Android sans-serif as the offline fallback), choose local Android font families, or load
-  TTF/OTF faces declared by another HTTP(S) CSS `@font-face` stylesheet.
+- Start with Noir Player's GothamPro CSS preset (weights 300, 400, 500, 700 and 900, including
+  italics). The app downloads its TTF faces on first use, validates them, and restores them from
+  app-private cache on later/offline launches; it does not redistribute the font binaries. You can
+  also choose local Android families or load another HTTP(S) CSS `@font-face` stylesheet.
 - Set a subtitle offset from -120 to +120 seconds, optionally remember it, and use previous/next
   cue alignment for the selected text track.
 - Export an offset-adjusted copy of the selected external text subtitle, including the first
@@ -69,7 +70,7 @@ same path is available through an Android document provider.
 
 ## Quick start
 
-1. Install the APK from the [v0.4.0 release](https://github.com/neura-neura/syncplay-droid/releases/tag/v0.4.0).
+1. Install the APK from the [latest published release](https://github.com/neura-neura/syncplay-droid/releases/latest).
 2. Enter the same server and exact room name as the desktop participants.
 3. Join the room and open your local copy, an HTTP(S) URL, or **SMB direct**.
 4. Open the **Room** tab and confirm that the file name, duration, and size match.
@@ -122,6 +123,6 @@ Protocol behavior was implemented from the compatible behavior of
 [syncplay-noir](https://github.com/neura-neura/syncplay-noir) and
 [Syncplay](https://github.com/Syncplay/syncplay).
 
-Syncplay Droid 0.4.0 is distributed under the [GNU GPL v3 or later](LICENSE). Attribution, native
+Syncplay Droid 0.4.2 is distributed under the [GNU GPL v3 or later](LICENSE). Attribution, native
 component licenses, and corresponding-source locations are documented in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

@@ -45,6 +45,7 @@ import dev.neura.syncplay.smb.SmbUri
 import dev.neura.syncplay.ui.subtitle.SubtitleAppearance
 import dev.neura.syncplay.ui.subtitle.SubtitlePreferences
 import dev.neura.syncplay.ui.subtitle.SubtitleExport
+import dev.neura.syncplay.ui.subtitle.SubtitleFontRegistry
 import dev.neura.syncplay.ui.subtitle.SubtitleSyncSettings
 import dev.neura.syncplay.ui.subtitle.SystemSubtitleFontCatalog
 import dev.neura.syncplay.ui.subtitle.toMpvProperties
@@ -81,6 +82,7 @@ class SyncplayViewModel(application: Application) : AndroidViewModel(application
     private var protocolEventsJob: Job? = null
     private var mediaLoadJob: Job? = null
     private var subtitleLoadJob: Job? = null
+    private var remoteFontLoadJob: Job? = null
     private var subtitleTimeoutJob: Job? = null
     private var currentMediaInfo: ResolvedMediaInfo? = null
     private var currentMediaUri: Uri? = null
@@ -92,12 +94,14 @@ class SyncplayViewModel(application: Application) : AndroidViewModel(application
     private var desiredExternalSubtitleId: String? = null
     private var mediaLoadGeneration = 0L
     private val subtitleSelectionGate = SubtitleSelectionGate()
+    private val remoteFontLoadGate = RemoteSubtitleFontLoadGate()
     private var lastSentDescriptor: MediaDescriptor? = null
     private var chatSequence = 0L
     private var passwordServerHost: String? = null
     private var serviceBound = false
     private var appliedNativeSubtitleVisibility: Boolean? = null
     private var subtitlePreferencesLoaded = false
+    private var remoteFontPreferencesRestored = false
 
     private val persistedSelectionUris = runCatching {
         app.contentResolver.persistedUriPermissions.asSequence()
@@ -158,6 +162,19 @@ class SyncplayViewModel(application: Application) : AndroidViewModel(application
                 subtitlePreferencesLoaded = true
                 _uiState.update { it.copy(subtitlePreferences = effective) }
                 applySubtitlePreferences(effective)
+                if (!remoteFontPreferencesRestored) {
+                    remoteFontPreferencesRestored = true
+                    val savedUrl = RemoteSubtitleFontLoader.savedCssUrl(app)
+                    val shouldRestore = SubtitleFontRegistry.isGothamPro(effective.appearance.fontFamily) ||
+                        !savedUrl.equals(RemoteSubtitleFontLoader.DEFAULT_CSS_URL, ignoreCase = true)
+                    if (shouldRestore && savedUrl.isNotBlank()) {
+                        loadRemoteSubtitleFont(
+                            savedUrl,
+                            reportFailure = false,
+                            preferCache = true,
+                        )
+                    }
+                }
             }
         }
         viewModelScope.launch {
@@ -179,9 +196,6 @@ class SyncplayViewModel(application: Application) : AndroidViewModel(application
         }
         PlaybackService.ensureStarted(app)
         bindPlaybackService()
-        RemoteSubtitleFontLoader.savedCssUrl(app).takeIf(String::isNotBlank)?.let { savedUrl ->
-            loadRemoteSubtitleFont(savedUrl, reportFailure = false)
-        }
         viewModelScope.launch {
             val fonts = withContext(Dispatchers.IO) { SystemSubtitleFontCatalog.load() }
             _uiState.update { it.copy(installedSubtitleFonts = fonts) }
@@ -488,8 +502,18 @@ class SyncplayViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun updateSubtitleAppearance(value: SubtitleAppearance) {
+        applySubtitleAppearance(value, cancelRemoteFontLoad = true)
+    }
+
+    private fun applySubtitleAppearance(
+        value: SubtitleAppearance,
+        cancelRemoteFontLoad: Boolean,
+    ) {
         val normalized = value.normalized()
         val current = _uiState.value
+        if (cancelRemoteFontLoad && normalized.fontFamily != current.subtitlePreferences.appearance.fontFamily) {
+            invalidateRemoteFontLoad()
+        }
         val switchingAwayFromRemoteFont = normalized.fontFamily != current.subtitlePreferences.appearance.fontFamily &&
             normalized.fontFamily !in current.remoteSubtitleFonts && current.remoteFontCssUrl.isNotBlank()
         _uiState.update {
@@ -505,8 +529,21 @@ class SyncplayViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun resetSubtitleAppearance() {
-        updateSubtitleAppearance(SubtitleAppearance.DEFAULT)
-        loadRemoteSubtitleFont(RemoteSubtitleFontLoader.DEFAULT_CSS_URL, reportFailure = false)
+        invalidateRemoteFontLoad()
+        RemoteSubtitleFontLoader.clearSavedCss(app)
+        _uiState.update {
+            it.copy(
+                remoteSubtitleFonts = emptyList(),
+                remoteFontCssUrl = "",
+                isRemoteFontLoading = false,
+            )
+        }
+        applySubtitleAppearance(SubtitleAppearance.DEFAULT, cancelRemoteFontLoad = false)
+        loadRemoteSubtitleFont(
+            RemoteSubtitleFontLoader.DEFAULT_CSS_URL,
+            reportFailure = true,
+            preferCache = true,
+        )
     }
 
     fun updateSubtitleSync(value: SubtitleSyncSettings) {
@@ -575,13 +612,20 @@ class SyncplayViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun updateRemoteFontCssUrl(value: String) {
-        _uiState.update { it.copy(remoteFontCssUrl = value.take(MAX_CSS_URL_LENGTH)) }
+        val nextUrl = value.take(MAX_CSS_URL_LENGTH)
+        if (nextUrl != _uiState.value.remoteFontCssUrl) invalidateRemoteFontLoad()
+        _uiState.update { it.copy(remoteFontCssUrl = nextUrl) }
     }
 
     fun loadRemoteSubtitleFont(rawUrl: String) = loadRemoteSubtitleFont(rawUrl, reportFailure = true)
 
-    private fun loadRemoteSubtitleFont(rawUrl: String, reportFailure: Boolean) {
+    private fun loadRemoteSubtitleFont(
+        rawUrl: String,
+        reportFailure: Boolean,
+        preferCache: Boolean = false,
+    ) {
         val url = rawUrl.trim()
+        invalidateRemoteFontLoad()
         if (url.isEmpty()) {
             RemoteSubtitleFontLoader.clearSavedCss(app)
             _uiState.update {
@@ -589,31 +633,51 @@ class SyncplayViewModel(application: Application) : AndroidViewModel(application
             }
             return
         }
+        val request = remoteFontLoadGate.begin(url)
         _uiState.update { it.copy(isRemoteFontLoading = true, remoteFontCssUrl = url) }
-        viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) { RemoteSubtitleFontLoader.load(app, url) }
-            result.onSuccess { fontSet ->
-                _uiState.update {
-                    it.copy(
-                        isRemoteFontLoading = false,
-                        remoteSubtitleFonts = fontSet.familyNames,
-                        playback = it.playback.copy(error = null),
-                    )
+        remoteFontLoadJob = viewModelScope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    if (preferCache) {
+                        RemoteSubtitleFontLoader.loadCached(app, url).recoverCatching {
+                            RemoteSubtitleFontLoader.load(app, url).getOrThrow()
+                        }
+                    } else {
+                        RemoteSubtitleFontLoader.load(app, url)
+                    }
                 }
-                updateSubtitleAppearance(
-                    _uiState.value.subtitlePreferences.appearance.copy(fontFamily = fontSet.primaryFamilyName),
-                )
-            }.onFailure { error ->
-                _uiState.update {
-                    it.copy(
-                        isRemoteFontLoading = false,
-                        playback = if (reportFailure) {
-                            it.playback.copy(error = "No se pudo cargar esa fuente: ${error.message.orEmpty()}")
-                        } else {
-                            it.playback
-                        },
+                ensureActive()
+                if (!isCurrentRemoteFontLoad(request)) return@launch
+                if (result.isSuccess) {
+                    val fontSet = result.getOrThrow()
+                    fontSet.register()
+                    runCatching { RemoteSubtitleFontLoader.saveCssUrl(app, request.url) }
+                    _uiState.update {
+                        it.copy(
+                            isRemoteFontLoading = false,
+                            remoteSubtitleFonts = fontSet.familyNames,
+                            playback = it.playback.copy(error = null),
+                        )
+                    }
+                    applySubtitleAppearance(
+                        _uiState.value.subtitlePreferences.appearance.copy(fontFamily = fontSet.primaryFamilyName),
+                        cancelRemoteFontLoad = false,
                     )
+                } else {
+                    val error = result.exceptionOrNull()
+                    _uiState.update {
+                        it.copy(
+                            isRemoteFontLoading = false,
+                            playback = if (reportFailure) {
+                                it.playback.copy(error = "No se pudo cargar esa fuente: ${error?.message.orEmpty()}")
+                            } else {
+                                it.playback
+                            },
+                        )
+                    }
                 }
+            } finally {
+                if (isCurrentRemoteFontLoad(request)) remoteFontLoadJob = null
             }
         }
     }
@@ -621,6 +685,18 @@ class SyncplayViewModel(application: Application) : AndroidViewModel(application
     fun clearPlaybackError() {
         _uiState.update { it.copy(playback = it.playback.copy(error = null)) }
     }
+
+    private fun invalidateRemoteFontLoad() {
+        remoteFontLoadGate.invalidate()
+        remoteFontLoadJob?.cancel()
+        remoteFontLoadJob = null
+        if (_uiState.value.isRemoteFontLoading) {
+            _uiState.update { it.copy(isRemoteFontLoading = false) }
+        }
+    }
+
+    private fun isCurrentRemoteFontLoad(request: RemoteSubtitleFontLoadGate.Request): Boolean =
+        remoteFontLoadGate.isCurrent(request, _uiState.value.remoteFontCssUrl)
 
     private fun beginMediaSelection(): Long {
         val generation = ++mediaLoadGeneration
@@ -1200,6 +1276,8 @@ class SyncplayViewModel(application: Application) : AndroidViewModel(application
         protocolEventsJob?.cancel()
         mediaLoadJob?.cancel()
         subtitleLoadJob?.cancel()
+        remoteFontLoadGate.invalidate()
+        remoteFontLoadJob?.cancel()
         subtitleTimeoutJob?.cancel()
         subtitleSelectionGate.invalidate()
         detachPlayer()

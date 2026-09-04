@@ -4,6 +4,7 @@ import android.graphics.Typeface
 import android.text.style.ForegroundColorSpan
 import android.text.style.StyleSpan
 import android.text.style.UnderlineSpan
+import androidx.core.text.HtmlCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -20,6 +21,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.TextStyle
@@ -27,11 +29,9 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import kotlin.math.roundToInt
-import androidx.core.text.HtmlCompat
 
 /**
  * Draws a subtitle over the caller's video surface.
@@ -51,13 +51,24 @@ fun SubtitleTextOverlay(
     if (text.isBlank()) return
 
     val style = appearance.normalized()
+    val configuration = LocalConfiguration.current
     val density = LocalDensity.current
     val styledText = remember(text) { subtitleHtmlToAnnotatedString(text) }
     val shadowText = remember(text) {
         subtitleHtmlToAnnotatedString(text.replace(Regex("</?font[^>]*>", RegexOption.IGNORE_CASE), ""))
     }
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
-        val availableWidth = maxWidth.takeIf { it.value.isFinite() } ?: 360.dp
+        val availableWidth = maxWidth.takeIf { it.value.isFinite() && it.value > 0f } ?: 360.dp
+        // Scale from the device window orientation, not this container's aspect ratio.  A portrait
+        // phone can host a letterboxed 16:9 player, and using that inner box would incorrectly
+        // treat it as landscape.  The persisted value remains the landscape reference while
+        // LocalConfiguration updates on rotation.
+        val effectiveStyle = style.scaledForViewport(
+            SubtitleViewport(
+                configuration.screenWidthDp.toFloat(),
+                configuration.screenHeightDp.toFloat(),
+            ),
+        )
         val contentMaxWidth = if (style.useCustomMaxWidth) {
             (availableWidth * (style.maxWidth / 100f).coerceIn(0.1f, 1f))
                 .coerceAtMost(availableWidth)
@@ -71,13 +82,13 @@ fun SubtitleTextOverlay(
         val textColor = subtitleComposeColor(style.textColor, Color.White)
         val backgroundColor = subtitleComposeColor(style.backgroundColor, Color.Black)
         val shape = RoundedCornerShape(style.borderRadius.dp)
-        val fontSize = with(density) { style.fontSize.dp.toSp() }
+        val fontSize = with(density) { effectiveStyle.fontSize.dp.toSp() }
         val letterSpacing = with(density) { style.letterSpacing.dp.toSp() }
         val baseTextStyle = TextStyle(
             color = textColor,
             fontSize = fontSize,
             fontWeight = FontWeight(style.fontWeight.coerceIn(1, 1_000)),
-            fontFamily = SubtitleFontRegistry.resolve(style.fontFamily),
+            fontFamily = SubtitleFontRegistry.resolve(style.fontFamily, style.fontWeight),
             lineHeight = style.lineHeight.em,
             letterSpacing = letterSpacing,
             textAlign = TextAlign.Center,

@@ -9,6 +9,49 @@ import org.junit.Test
 
 class SubtitlePreferencesCodecTest {
     @Test
+    fun migratesUntouchedLegacyThirtyEightPointPresetToTwentySeven() {
+        val legacy = SubtitlePreferences.DEFAULT.copy(
+            appearance = SubtitleAppearance.DEFAULT.copy(fontSize = 38f),
+        )
+        val unversioned = SubtitlePreferencesCodec.encode(legacy).toMutableMap().apply {
+            remove(SubtitlePreferencesCodec.APPEARANCE_PRESET_VERSION_KEY)
+        }
+
+        val migrated = SubtitlePreferencesCodec.decode(unversioned)
+
+        assertEquals(27f, migrated.appearance.fontSize)
+    }
+
+    @Test
+    fun migratesLegacyGothamNameWithoutFallbackToTwentySeven() {
+        val legacy = SubtitlePreferences.DEFAULT.copy(
+            appearance = SubtitleAppearance.DEFAULT.copy(
+                fontSize = 38f,
+                fontFamily = "GothamPro",
+            ),
+        )
+        val unversioned = SubtitlePreferencesCodec.encode(legacy).toMutableMap().apply {
+            remove(SubtitlePreferencesCodec.APPEARANCE_PRESET_VERSION_KEY)
+        }
+
+        val migrated = SubtitlePreferencesCodec.decode(unversioned)
+
+        assertEquals(27f, migrated.appearance.fontSize)
+        assertEquals("GothamPro", migrated.appearance.fontFamily)
+    }
+
+    @Test
+    fun preservesExplicitThirtyEightPointPresetOnceVersioned() {
+        val explicit = SubtitlePreferences.DEFAULT.copy(
+            appearance = SubtitleAppearance.DEFAULT.copy(fontSize = 38f),
+        )
+
+        val decoded = SubtitlePreferencesCodec.decode(SubtitlePreferencesCodec.encode(explicit))
+
+        assertEquals(38f, decoded.appearance.fontSize)
+    }
+
+    @Test
     fun encodeAndDecodeRoundTripUsesNormalizedValues() {
         val source = SubtitlePreferences(
             appearance = SubtitleAppearance(

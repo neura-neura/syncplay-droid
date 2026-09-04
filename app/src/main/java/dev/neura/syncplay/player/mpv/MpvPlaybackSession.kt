@@ -218,7 +218,12 @@ class MpvPlaybackSession(
     }
 
     fun attachOutput(output: Any?, origin: MpvEventOrigin = MpvEventOrigin.SYSTEM) {
-        if (closed.get() || this.output === output) return
+        if (closed.get()) return
+        if (this.output === output) {
+            // A Compose-managed handle keeps its identity while its surface dimensions change.
+            if (output is MpvSurfaceOutput) engine.setVideoOutput(output)
+            return
+        }
         this.output = output
         engine.setVideoOutput(output)
         emitCommand(MpvPlaybackEvent.Kind.STATE_CHANGED, origin)

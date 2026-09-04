@@ -7,6 +7,45 @@ import org.junit.Test
 
 class SubtitleAppearanceMappingTest {
     @Test
+    fun defaultFontSizeIsTwentySevenLandscapeReferenceUnits() {
+        assertEquals(27f, SubtitleAppearance.DEFAULT.fontSize)
+        assertEquals(27f, SubtitleAppearance.DEFAULT.scaledForViewport(1_920f, 1_080f).fontSize)
+        assertEquals(27f, SubtitleAppearance.DEFAULT.toMpvProperties()["sub-font-size"])
+    }
+
+    @Test
+    fun portraitFontSizeShrinksWithTheExactViewportRatio() {
+        val appearance = SubtitleAppearance.DEFAULT
+
+        assertEquals(15.1875f, appearance.scaledForViewport(360f, 640f).fontSize, 0.001f)
+        assertEquals(10.8f, appearance.scaledForViewport(360f, 900f).fontSize, 0.001f)
+        assertEquals(12.15f, appearance.scaledForViewport(1_080f, 2_400f).fontSize, 0.001f)
+        assertEquals(27f, appearance.scaledForViewport(640f, 360f).fontSize, 0.001f)
+        assertEquals(27f, appearance.scaledForViewport(0f, 0f).fontSize, 0.001f)
+    }
+
+    @Test
+    fun viewportScaleHandlesFoldableAndInvalidWindowDimensions() {
+        assertEquals(0.75f, SubtitleViewport(1_200f, 1_600f).orientationScale, 0.001f)
+        assertEquals(0.18f, SubtitleViewport(360f, 2_000f).orientationScale, 0.001f)
+        assertEquals(1f, SubtitleViewport(0f, 640f).orientationScale, 0.001f)
+        assertEquals(1f, SubtitleViewport(-360f, 640f).orientationScale, 0.001f)
+        assertEquals(1f, SubtitleViewport(Float.NaN, 640f).orientationScale, 0.001f)
+        assertEquals(1f, SubtitleViewport(360f, Float.POSITIVE_INFINITY).orientationScale, 0.001f)
+    }
+
+    @Test
+    fun mpvMappingUsesTheSameViewportScale() {
+        val properties = SubtitleAppearance(
+            fontSize = 36f,
+            lineHeight = 1.5f,
+        ).toMpvProperties(SubtitleViewport(360f, 640f))
+
+        assertEquals(20.25f, properties["sub-font-size"])
+        assertEquals(10.125f, properties["sub-line-spacing"])
+    }
+
+    @Test
     fun mapsNoirAppearanceControlsToMpvProperties() {
         val properties = SubtitleAppearance(
             fontSize = 36f,
@@ -53,7 +92,7 @@ class SubtitleAppearanceMappingTest {
 
     @Test
     fun resolvesDefaultAndQuotedFontFamilyNames() {
-        assertEquals("sans-serif", SubtitleAppearance.DEFAULT.toMpvProperties()["sub-font"])
+        assertEquals("GothamPro", SubtitleAppearance.DEFAULT.toMpvProperties()["sub-font"])
         assertEquals(
             "Noto Sans",
             SubtitleAppearance(fontFamily = "\"Noto Sans\", sans-serif").toMpvProperties()["sub-font"],

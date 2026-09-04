@@ -4,12 +4,14 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
-import android.view.SurfaceView
 import android.os.Build
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.AndroidExternalSurface
 import androidx.compose.foundation.background
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -109,8 +111,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -119,6 +123,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.Role
@@ -132,7 +137,6 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -146,13 +150,18 @@ import dev.neura.syncplay.player.AudioFormatDiagnostics
 import dev.neura.syncplay.player.PlaybackDiagnostics
 import dev.neura.syncplay.player.VideoFormatDiagnostics
 import dev.neura.syncplay.player.SourceAccessClassification
+import dev.neura.syncplay.player.mpv.MpvSurfaceOutput
 import dev.neura.syncplay.ui.subtitle.SubtitleCustomizationDialog
 import dev.neura.syncplay.ui.subtitle.SubtitleTextOverlay
 import dev.neura.syncplay.ui.subtitle.SubtitleAppearance
 import dev.neura.syncplay.ui.subtitle.SubtitleExport
 import dev.neura.syncplay.ui.subtitle.SubtitleSyncSettings
 import java.util.Locale
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.delay
 import kotlin.math.abs
+
+private const val PLAYER_CONTROLS_HIDE_DELAY_MS = 2_200L
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -202,6 +211,8 @@ fun PlayerRoomScreen(
     val subtitleExportName = selectedSubtitleTrack
         ?.takeIf { it.isExternal && it.isText && SubtitleExport.supports(it.label) }
         ?.let { SubtitleExport.suggestedFileName(it.label) }
+    val keepPlayerControlsVisible = showUrlDialog || showRoomDialog || showSubtitleDialog ||
+        showDiagnosticsDialog || showSubtitleCustomization
 
     LaunchedEffect(state.playerAvailable, state.media) {
         if (!state.playerAvailable || state.media == null) isFullscreen = false
@@ -222,6 +233,7 @@ fun PlayerRoomScreen(
             onSeekBy = onSeekBy,
             onAttachVideoOutput = onAttachVideoOutput,
             onClearVideoOutput = onClearVideoOutput,
+            keepControlsVisible = keepPlayerControlsVisible,
         )
         if (showSubtitleDialog) {
             SubtitleSelectorDialog(
@@ -332,6 +344,7 @@ fun PlayerRoomScreen(
                                 onSeekBy = onSeekBy,
                                 onAttachVideoOutput = onAttachVideoOutput,
                                 onClearVideoOutput = onClearVideoOutput,
+                                keepControlsVisible = keepPlayerControlsVisible,
                                 modifier = Modifier
                                     .weight(1f)
                                     .fillMaxWidth(),
@@ -383,6 +396,7 @@ fun PlayerRoomScreen(
                                 onSeekBy = onSeekBy,
                                 onAttachVideoOutput = onAttachVideoOutput,
                                 onClearVideoOutput = onClearVideoOutput,
+                                keepControlsVisible = keepPlayerControlsVisible,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .heightIn(min = 310.dp)
@@ -402,6 +416,7 @@ fun PlayerRoomScreen(
                                 onSeekBy = onSeekBy,
                                 onAttachVideoOutput = onAttachVideoOutput,
                                 onClearVideoOutput = onClearVideoOutput,
+                                keepControlsVisible = keepPlayerControlsVisible,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .aspectRatio(16f / 9f)
@@ -896,11 +911,7 @@ private fun formatBitrate(bitrate: Int): String = when {
     else -> "$bitrate b/s"
 }
 
-private fun formatDurationMs(durationMs: Long): String = when {
-    durationMs >= 60_000L -> String.format(Locale.ROOT, "%.1f min", durationMs / 60_000.0)
-    durationMs >= 1_000L -> String.format(Locale.ROOT, "%.1f s", durationMs / 1_000.0)
-    else -> "$durationMs ms"
-}
+private fun formatDurationMs(durationMs: Long): String = formatPlaybackTimeMs(durationMs)
 
 private fun formatLongBitrate(bitsPerSecond: Long): String = when {
     bitsPerSecond >= 1_000_000L -> String.format(Locale.ROOT, "%.1f Mb/s", bitsPerSecond / 1_000_000.0)
@@ -1160,6 +1171,7 @@ private fun PlayerPane(
     onSeekBy: (Long) -> Unit,
     onAttachVideoOutput: (Any?) -> Unit,
     onClearVideoOutput: (Any?) -> Unit,
+    keepControlsVisible: Boolean,
     modifier: Modifier = Modifier,
 ) {
     val hasMedia = state.media != null
@@ -1188,6 +1200,7 @@ private fun PlayerPane(
                 onSubtitleCustomization = onSubtitleCustomization,
                 onAttachVideoOutput = onAttachVideoOutput,
                 onClearVideoOutput = onClearVideoOutput,
+                keepControlsVisible = keepControlsVisible,
             )
         }
         if (state.media == null) {
@@ -1339,6 +1352,7 @@ private fun MpvPlayerSurface(
     state: SyncplayUiState,
     isFullscreen: Boolean,
     controlsEnabled: Boolean = true,
+    keepControlsVisible: Boolean = false,
     onFullscreenChange: (Boolean) -> Unit,
     onTogglePlayback: () -> Unit,
     onSeekTo: (Long) -> Unit,
@@ -1347,26 +1361,70 @@ private fun MpvPlayerSurface(
     onAttachVideoOutput: (Any?) -> Unit,
     onClearVideoOutput: (Any?) -> Unit,
 ) {
+    var controlsVisible by rememberSaveable(state.mediaUri, isFullscreen) { mutableStateOf(true) }
+    var controlsInteraction by remember(state.mediaUri, isFullscreen) { mutableIntStateOf(0) }
+    var isDragging by remember(state.mediaUri, isFullscreen) { mutableStateOf(false) }
+    val gestureInteractionSource = remember { MutableInteractionSource() }
+    val revealControls = {
+        controlsVisible = true
+        controlsInteraction += 1
+    }
+
+    LaunchedEffect(
+        state.mediaUri,
+        isFullscreen,
+        controlsEnabled,
+        keepControlsVisible,
+        state.playback.paused,
+        isDragging,
+        controlsInteraction,
+    ) {
+        when {
+            // Keep the initial visible state while loading; rendering is gated below. Once the
+            // video becomes ready, the controls appear and receive their normal hide timeout.
+            !controlsEnabled -> controlsVisible = true
+            keepControlsVisible || state.playback.paused || isDragging -> controlsVisible = true
+            controlsVisible -> {
+                delay(PLAYER_CONTROLS_HIDE_DELAY_MS)
+                controlsVisible = false
+            }
+        }
+    }
+
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-        AndroidView(
-            factory = { context ->
-                SurfaceView(context).apply {
-                    setZOrderMediaOverlay(false)
-                    setBackgroundColor(android.graphics.Color.BLACK)
-                    keepScreenOn = true
-                    onAttachVideoOutput(this)
-                }
-            },
-            update = { onAttachVideoOutput(it) },
-            onRelease = { onClearVideoOutput(it) },
+        MpvVideoOutputSurface(
+            onAttachVideoOutput = onAttachVideoOutput,
+            onClearVideoOutput = onClearVideoOutput,
             modifier = Modifier.fillMaxSize(),
+        )
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .testTag("mpv-video-gesture-layer")
+                .clickable(
+                    interactionSource = gestureInteractionSource,
+                    indication = null,
+                    enabled = controlsEnabled,
+                    onClickLabel = if (controlsVisible) {
+                        "Alternar controles de reproducción"
+                    } else {
+                        "Mostrar controles de reproducción"
+                    },
+                    role = Role.Button,
+                ) {
+                    if (controlsVisible && !state.playback.paused && !keepControlsVisible) {
+                        controlsVisible = false
+                    } else {
+                        revealControls()
+                    }
+                },
         )
         SubtitleTextOverlay(
             text = state.subtitleText.orEmpty(),
             appearance = state.subtitlePreferences.appearance,
             modifier = Modifier.fillMaxSize(),
         )
-        if (controlsEnabled) {
+        if (controlsEnabled && controlsVisible) {
             MpvControls(
                 state = state,
                 isFullscreen = isFullscreen,
@@ -1375,8 +1433,49 @@ private fun MpvPlayerSurface(
                 onSeekTo = onSeekTo,
                 onSeekBy = onSeekBy,
                 onSubtitleCustomization = onSubtitleCustomization,
-                modifier = Modifier.align(Alignment.BottomCenter),
+                onInteraction = revealControls,
+                onDraggingChange = { isDragging = it },
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .testTag("mpv-controls"),
             )
+        }
+    }
+}
+
+/** Compose-native lifecycle bridge for MPV's externally rendered Android surface. */
+@Composable
+internal fun MpvVideoOutputSurface(
+    onAttachVideoOutput: (Any?) -> Unit,
+    onClearVideoOutput: (Any?) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val latestAttach by rememberUpdatedState(onAttachVideoOutput)
+    val latestClear by rememberUpdatedState(onClearVideoOutput)
+    AndroidExternalSurface(
+        modifier = modifier,
+        isOpaque = true,
+    ) {
+        onSurface { surface, width, height ->
+            val output = MpvSurfaceOutput(surface, width, height)
+            var cleared = false
+            fun clearOutputOnce() {
+                if (!cleared) {
+                    cleared = true
+                    latestClear(output)
+                }
+            }
+            latestAttach(output)
+            surface.onChanged { newWidth, newHeight ->
+                output.updateSize(newWidth, newHeight)
+                latestAttach(output)
+            }
+            surface.onDestroyed { clearOutputOnce() }
+            try {
+                awaitCancellation()
+            } finally {
+                clearOutputOnce()
+            }
         }
     }
 }
@@ -1390,57 +1489,124 @@ private fun MpvControls(
     onSeekTo: (Long) -> Unit,
     onSeekBy: (Long) -> Unit,
     onSubtitleCustomization: () -> Unit,
+    onInteraction: () -> Unit,
+    onDraggingChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val duration = state.playback.durationMs.coerceAtLeast(0L)
     var draggedPosition by remember(duration) { mutableStateOf<Float?>(null) }
-    val displayedPosition = draggedPosition
-        ?: state.playback.positionMs.coerceIn(0L, duration.takeIf { it > 0L } ?: 1L).toFloat()
+    var showRemaining by rememberSaveable(state.mediaUri) { mutableStateOf(false) }
+    val displayedPositionMs = draggedPosition?.toLong() ?: if (duration > 0L) {
+        state.playback.positionMs.coerceIn(0L, duration)
+    } else {
+        state.playback.positionMs.coerceAtLeast(0L)
+    }
+    val timeLabel = playbackTimeLabel(displayedPositionMs, duration, showRemaining)
+    val timeDescription = if (showRemaining) {
+        "Tiempo restante ${formatPlaybackTimeMs((duration - displayedPositionMs).coerceAtLeast(0L))} " +
+            "de ${formatPlaybackTimeMs(duration)}"
+    } else {
+        "Posición ${formatPlaybackTimeMs(displayedPositionMs)} de ${formatPlaybackTimeMs(duration)}"
+    }
     Surface(
         modifier = modifier.fillMaxWidth(),
         color = Color.Black.copy(alpha = 0.64f),
         contentColor = Color.White,
     ) {
         Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
-            Slider(
-                value = displayedPosition,
-                onValueChange = { draggedPosition = it },
-                onValueChangeFinished = {
-                    draggedPosition?.let { onSeekTo(it.toLong()) }
-                    draggedPosition = null
-                },
-                valueRange = 0f..duration.coerceAtLeast(1L).toFloat(),
-                enabled = state.playback.isSeekable && duration > 0L,
-                modifier = Modifier.fillMaxWidth().semantics {
-                    stateDescription = "${formatDurationMs(displayedPosition.toLong())} de ${formatDurationMs(duration)}"
-                },
-            )
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                IconButton(onClick = { onSeekBy(-5_000L) }, enabled = state.playback.isSeekable) {
+                Box(
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .clickable(role = Role.Button) {
+                            onInteraction()
+                            showRemaining = !showRemaining
+                        }
+                        .semantics { stateDescription = timeDescription }
+                        .padding(horizontal = 6.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = timeLabel,
+                        style = MaterialTheme.typography.labelMedium,
+                        maxLines = 1,
+                    )
+                }
+                Slider(
+                    value = displayedPositionMs.coerceIn(0L, duration.coerceAtLeast(1L)).toFloat(),
+                    onValueChange = {
+                        onDraggingChange(true)
+                        onInteraction()
+                        draggedPosition = it
+                    },
+                    onValueChangeFinished = {
+                        draggedPosition?.let { onSeekTo(it.toLong()) }
+                        draggedPosition = null
+                        onDraggingChange(false)
+                        onInteraction()
+                    },
+                    valueRange = 0f..duration.coerceAtLeast(1L).toFloat(),
+                    enabled = state.playback.isSeekable && duration > 0L,
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("mpv-slider")
+                        .semantics {
+                            stateDescription = timeDescription
+                        },
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceEvenly,
+            ) {
+                IconButton(
+                    onClick = {
+                        onInteraction()
+                        onSeekBy(-5_000L)
+                    },
+                    enabled = state.playback.isSeekable,
+                ) {
                     Icon(Icons.Rounded.Replay5, contentDescription = "Retroceder 5 segundos")
                 }
-                IconButton(onClick = onTogglePlayback) {
+                IconButton(
+                    onClick = {
+                        onInteraction()
+                        onTogglePlayback()
+                    },
+                ) {
                     Icon(
                         if (state.playback.paused) Icons.Rounded.PlayArrow else Icons.Rounded.Pause,
                         contentDescription = if (state.playback.paused) "Reproducir" else "Pausar",
                         modifier = Modifier.size(34.dp),
                     )
                 }
-                IconButton(onClick = { onSeekBy(10_000L) }, enabled = state.playback.isSeekable) {
+                IconButton(
+                    onClick = {
+                        onInteraction()
+                        onSeekBy(10_000L)
+                    },
+                    enabled = state.playback.isSeekable,
+                ) {
                     Icon(Icons.Rounded.Forward10, contentDescription = "Adelantar 10 segundos")
                 }
-                Text(
-                    "${formatDurationMs(displayedPosition.toLong())} · ${formatDurationMs(duration)}",
-                    style = MaterialTheme.typography.labelMedium,
-                )
-                IconButton(onClick = onSubtitleCustomization) {
+                IconButton(
+                    onClick = {
+                        onInteraction()
+                        onSubtitleCustomization()
+                    },
+                ) {
                     Icon(Icons.Rounded.Tune, contentDescription = "Personalizar subtítulos")
                 }
-                IconButton(onClick = { onFullscreenChange(!isFullscreen) }) {
+                IconButton(
+                    onClick = {
+                        onInteraction()
+                        onFullscreenChange(!isFullscreen)
+                    },
+                ) {
                     Icon(
                         if (isFullscreen) Icons.Rounded.FullscreenExit else Icons.Rounded.Fullscreen,
                         contentDescription = if (isFullscreen) "Salir de pantalla completa" else "Pantalla completa",
@@ -1464,6 +1630,7 @@ private fun FullscreenPlayerScreen(
     onSeekBy: (Long) -> Unit,
     onAttachVideoOutput: (Any?) -> Unit,
     onClearVideoOutput: (Any?) -> Unit,
+    keepControlsVisible: Boolean,
 ) {
     Box(
         modifier = Modifier.fillMaxSize().background(Color.Black),
@@ -1474,6 +1641,7 @@ private fun FullscreenPlayerScreen(
                 state = state,
                 isFullscreen = true,
                 controlsEnabled = !isMediaLoading,
+                keepControlsVisible = keepControlsVisible,
                 onFullscreenChange = onFullscreenChange,
                 onTogglePlayback = onTogglePlayback,
                 onSeekTo = onSeekTo,

@@ -8,12 +8,14 @@ import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import dev.neura.syncplay.protocol.ConnectionConfig
 import dev.neura.syncplay.protocol.ConnectionStatus
 import dev.neura.syncplay.protocol.MediaDescriptor
+import dev.neura.syncplay.player.mpv.MpvPlaybackPhase
 import dev.neura.syncplay.ui.theme.SyncplayTheme
 import org.junit.Assert.assertEquals
 import org.junit.Rule
@@ -243,5 +245,78 @@ class ExpressiveScreensTest {
         composeRule.onAllNodesWithText("Anterior aquí").assertCountEquals(1)
         composeRule.onAllNodesWithText("Siguiente aquí").assertCountEquals(1)
         composeRule.onAllNodesWithText("Descargar ajustados").assertCountEquals(1)
+    }
+
+    @Test
+    fun playerTimeUpdatesTogglesRemainingAndControlsAutoHide() {
+        composeRule.mainClock.autoAdvance = false
+        val duration = 116L * 60_000L + 36_000L
+        var roomState by mutableStateOf(
+            SyncplayUiState(
+                connectionStatus = ConnectionStatus.Connected(
+                    endpoint = "192.0.2.65:8999",
+                    secure = false,
+                    serverVersion = "1.7.4",
+                ),
+                isInRoom = true,
+                effectiveUsername = "android-user",
+                effectiveRoom = "movies",
+                playerAvailable = true,
+                media = MediaDescriptor("Movie.mkv", duration / 1_000.0, 8_000_000_000L),
+                mediaUri = "content://fixture/Movie.mkv",
+                playback = PlaybackUiState(
+                    positionMs = 18L * 60_000L + 12_000L,
+                    durationMs = duration,
+                    paused = false,
+                    isReady = true,
+                    isSeekable = true,
+                    phase = MpvPlaybackPhase.PLAYING,
+                ),
+            ),
+        )
+
+        composeRule.setContent {
+            SyncplayTheme {
+                PlayerRoomScreen(
+                    state = roomState,
+                    onOpenFile = {},
+                    onOpenUrl = {},
+                    onOpenSubtitle = {},
+                    onToggleReady = {},
+                    onSendChat = { true },
+                    onChangeRoom = {},
+                    onDisconnect = {},
+                    onDismissPlaybackError = {},
+                )
+            }
+        }
+        composeRule.mainClock.advanceTimeByFrame()
+
+        composeRule.onNodeWithText("00:18:12 / 01:56:36").assertIsDisplayed()
+        composeRule.runOnIdle {
+            roomState = roomState.copy(
+                playback = roomState.playback.copy(positionMs = 18L * 60_000L + 13_000L),
+            )
+        }
+        composeRule.mainClock.advanceTimeByFrame()
+        composeRule.onNodeWithText("00:18:13 / 01:56:36").performClick()
+        composeRule.mainClock.advanceTimeByFrame()
+        composeRule.onNodeWithText("-01:38:23 / 01:56:36").assertIsDisplayed()
+
+        composeRule.mainClock.advanceTimeBy(PLAYER_CONTROLS_TEST_TIMEOUT_MS)
+        composeRule.onNodeWithTag("mpv-controls").assertDoesNotExist()
+        composeRule.onNodeWithTag("mpv-video-gesture-layer").performClick()
+        composeRule.mainClock.advanceTimeByFrame()
+        composeRule.onNodeWithTag("mpv-controls").assertIsDisplayed()
+
+        composeRule.runOnIdle {
+            roomState = roomState.copy(playback = roomState.playback.copy(paused = true))
+        }
+        composeRule.mainClock.advanceTimeBy(5_000L)
+        composeRule.onNodeWithTag("mpv-controls").assertIsDisplayed()
+    }
+
+    private companion object {
+        const val PLAYER_CONTROLS_TEST_TIMEOUT_MS = 2_500L
     }
 }

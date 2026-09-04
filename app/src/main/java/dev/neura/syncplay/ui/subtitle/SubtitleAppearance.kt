@@ -4,6 +4,55 @@ import java.util.Locale
 import kotlin.math.roundToInt
 
 /**
+ * The dimensions of the surface that owns a subtitle overlay.
+ *
+ * [width] and [height] are deliberately unit-agnostic.  Compose supplies dp and MPV can supply
+ * physical surface pixels; only their ratio is used, so both renderers apply the same orientation
+ * scale without coupling the preference model to a UI toolkit.
+ */
+data class SubtitleViewport(
+    val width: Float,
+    val height: Float,
+) {
+    /**
+     * Scale relative to the landscape reference size.
+     *
+     * A landscape viewport keeps the persisted value unchanged (27 by default).  In portrait,
+     * text is reduced in proportion to the available width: the width-to-height ratio is below
+     * one, so a caption tuned for landscape does not consume too much of the narrower video.
+     * Invalid or zero dimensions are treated as the landscape reference.  The text-size range
+     * itself supplies the readability floor, so ordinary tall phones keep the exact proportional
+     * reduction instead of being held at an oversized 50 percent.
+     */
+    val orientationScale: Float
+        get() {
+            val safeWidth = width.takeIf { it.isFinite() && it > 0f } ?: return 1f
+            val safeHeight = height.takeIf { it.isFinite() && it > 0f } ?: return 1f
+            if (safeHeight <= safeWidth) return 1f
+            return (safeWidth / safeHeight).coerceAtMost(1f)
+        }
+}
+
+/**
+ * Returns the appearance as rendered in [viewport].  The preference value remains the
+ * orientation-independent landscape reference; only the effective font size is scaled at the
+ * composition/native-render boundary.
+ */
+fun SubtitleAppearance.scaledForViewport(viewport: SubtitleViewport?): SubtitleAppearance {
+    val scale = viewport?.orientationScale ?: 1f
+    return copy(
+        fontSize = (fontSize * scale).coerceIn(
+            SubtitleAppearanceRanges.fontSizeTyped.min,
+            SubtitleAppearanceRanges.fontSizeTyped.max,
+        ),
+    )
+}
+
+/** Convenience overload for callers that only have raw surface dimensions. */
+fun SubtitleAppearance.scaledForViewport(width: Float, height: Float): SubtitleAppearance =
+    scaledForViewport(SubtitleViewport(width, height))
+
+/**
  * The persisted appearance contract for subtitles.
  *
  * The numeric values intentionally mirror Noir Player's CSS controls.  The Android overlay
@@ -81,7 +130,9 @@ data class SubtitleAppearance(
         const val DEFAULT_FONT_FAMILY: String = "GothamPro, sans-serif"
 
         val DEFAULT: SubtitleAppearance = SubtitleAppearance(
-            fontSize = 38f,
+            // 27 is Noir's landscape reference.  Portrait rendering applies the viewport scale
+            // at the overlay/native boundary instead of persisting a device-specific value.
+            fontSize = 27f,
             textColor = "#FFFFFF",
             backgroundColor = "#000000",
             backgroundOpacity = 0.23f,
@@ -189,8 +240,8 @@ data class SubtitlePreferences(
  * included: MPV/libass has no rounded caption-box equivalent, so radius remains Compose-overlay
  * only.  [SubtitleAppearance.lineHeight] is represented by the additional line-spacing property.
  */
-fun SubtitleAppearance.toMpvProperties(): Map<String, Any> {
-    val style = normalized()
+fun SubtitleAppearance.toMpvProperties(viewport: SubtitleViewport? = null): Map<String, Any> {
+    val style = normalized().scaledForViewport(viewport)
     val backgroundOpacity = style.backgroundOpacity.coerceIn(0f, 1f)
     val lineSpacing = ((style.lineHeight - 1f) * style.fontSize).coerceIn(-100f, 100f)
     return linkedMapOf(
@@ -246,9 +297,7 @@ fun normalizeSubtitleHexColor(value: String, fallback: String = "#FFFFFF"): Stri
 
 private fun String.toMpvFontName(): String {
     val trimmed = trim()
-    if (trimmed.isEmpty() || trimmed.equals(SubtitleAppearance.DEFAULT_FONT_FAMILY, ignoreCase = true)) {
-        return "sans-serif"
-    }
+    if (trimmed.isEmpty()) return "sans-serif"
     return trimmed
         .substringBefore(',')
         .trim()
